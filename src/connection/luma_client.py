@@ -25,9 +25,7 @@ class WebSocketConnection:
         self.token: str = token
         self._session: Optional[ClientSession] = None
         self._ws: Optional[ClientWebSocketResponse] = None
-        self._handler: Optional[Callable[[str | bytes], Coroutine[Any, Any, None]]] = (
-            None
-        )
+        self._handler: Optional[Callable[[str | bytes], Coroutine[Any, Any, None]]] = None
         self._running_flag: asyncio.Event = running_flag
 
     @property
@@ -119,9 +117,9 @@ class WebSocketConnection:
                     logger.info("停止监听消息")
                     break
                 if msg.type == WSMsgType.TEXT:
-                    await self._handler(msg.data)
+                    asyncio.create_task(self._handler(msg.data))
                 elif msg.type == WSMsgType.BINARY:
-                    await self._handler(msg.data)
+                    asyncio.create_task(self._handler(msg.data))
                 elif msg.type == WSMsgType.CLOSED:
                     logger.info("连接已关闭")
                     self._running_flag.set()

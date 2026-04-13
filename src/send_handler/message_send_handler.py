@@ -1,21 +1,18 @@
-from typing import Optional, Dict, Any, Tuple
-
 import asyncio
 import json
 import uuid
+from typing import Any, Dict, Optional, Tuple
 
 from ..connection.luma_client import WebSocketConnection
 from ..logger import logger
 
 
-class MessageSendHandler:
+class LumaSendHandler:
     def __init__(self, connection: WebSocketConnection) -> None:
         self._connection = connection
         self._response_pool: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
 
-    async def send_payload(
-        self, payload_type: str, payload_data: dict
-    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    async def send_payload(self, payload_type: str, payload_data: dict) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """发送消息负载"""
         uuid_str = str(uuid.uuid4())
         payload = {
@@ -41,4 +38,4 @@ class MessageSendHandler:
             future.cancel()
         finally:
             self._response_pool.pop(uuid_str, None)
-            return False, None
+        return False, None

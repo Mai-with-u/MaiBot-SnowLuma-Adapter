@@ -1,0 +1,38 @@
+[project]
+name = "SnowLuma-Adapter"
+version = "0.1.0"
+description = "MaiBot SnowLuma Adapter - 对接SnowLuma的适配器"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.13.0", "tomlkit>=0.14.0", "maibot-sdk>=2.3.0"]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.15.0"]
+    
+[project.urls]
+Homepage = "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
+Repository = "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter.git"
+Issues = "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter/issues"
+
+[tool.ruff]
+
+include = ["*.py"]
+
+# 行长度设置
+line-length = 120
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+unfixable = []
+
+# 如果一个变量的名称以下划线开头，即使它未被使用，也不应该被视为错误或警告。
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# 启用的规则
+select = [
+    "E", # pycodestyle 错误
+    "F", # pyflakes
+    "B", # flake8-bugbear
+]
+
+ignore = ["E711", "E501"]

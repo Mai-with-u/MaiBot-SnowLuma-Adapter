@@ -2,3 +2,4 @@ logs/**
 .vscode
 test/**
 **/__pycache__/**
+config.toml
