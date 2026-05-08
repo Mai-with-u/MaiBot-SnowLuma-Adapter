@@ -5,7 +5,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
-from maibot_sdk import Field, MaiBotPlugin, MessageGateway, PluginConfigBase
+from maibot_sdk import API, Field, MaiBotPlugin, MessageGateway, PluginConfigBase
 from pydantic import field_validator
 
 import asyncio
@@ -278,6 +278,40 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.debug(f"SnowLuma 适配器收到配置更新: {version}")
         await self._restart_connection_if_needed()
 
+    @API("adapter.napcat.group.get_group_member_info", description="获取群成员信息", version="1", public=True)
+    async def api_get_group_member_info(
+        self,
+        group_id: Any,
+        user_id: Any,
+        no_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """获取群成员信息。"""
+
+        return await self._call_action(
+            "get_group_member_info",
+            {
+                "group_id": self._normalize_positive_id(group_id, "group_id"),
+                "user_id": self._normalize_positive_id(user_id, "user_id"),
+                "no_cache": bool(no_cache),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_ban", description="设置群成员禁言", version="1", public=True)
+    async def api_set_group_ban(self, group_id: Any, user_id: Any, duration: Any) -> Dict[str, Any]:
+        """设置群成员禁言。"""
+
+        normalized_duration = self._normalize_non_negative_int(duration, "duration")
+        if normalized_duration > 2592000:
+            raise ValueError("duration 不能超过 2592000 秒")
+        return await self._call_action(
+            "set_group_ban",
+            {
+                "group_id": self._normalize_positive_id(group_id, "group_id"),
+                "user_id": self._normalize_positive_id(user_id, "user_id"),
+                "duration": normalized_duration,
+            },
+        )
+
     @MessageGateway(
         name=SNOWLUMA_GATEWAY_NAME,
         route_type="duplex",
@@ -521,6 +555,61 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         finally:
             self._response_pool.pop(echo, None)
 
+    @staticmethod
+    def _normalize_positive_id(value: Any, field_name: str) -> int:
+        """规范化 QQ 号、群号等正整数标识。"""
+
+        try:
+            normalized_value = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是正整数") from exc
+        if normalized_value <= 0:
+            raise ValueError(f"{field_name} 必须是正整数")
+        return normalized_value
+
+    @staticmethod
+    def _normalize_non_negative_int(value: Any, field_name: str) -> int:
+        """规范化非负整数参数。"""
+
+        try:
+            normalized_value = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是非负整数") from exc
+        if normalized_value < 0:
+            raise ValueError(f"{field_name} 必须是非负整数")
+        return normalized_value
+
+    @staticmethod
+    def _normalize_inbound_reply_id(value: Any) -> str:
+        """规范化入站引用消息 ID，过滤 SnowLuma/OneBot 的空引用。"""
+
+        normalized_value = str(value or "").strip()
+        if not normalized_value:
+            return ""
+        try:
+            reply_id = int(normalized_value)
+        except ValueError:
+            return normalized_value
+        if reply_id == 0:
+            return ""
+        return str(reply_id)
+
+    @staticmethod
+    def _extract_reply_target_id(raw_message: List[Dict[str, Any]]) -> str:
+        """从标准消息段中提取首个引用目标 ID。"""
+
+        for segment in raw_message:
+            if not isinstance(segment, dict) or segment.get("type") != "reply":
+                continue
+            data = segment.get("data")
+            if isinstance(data, Mapping):
+                target_message_id = str(data.get("target_message_id") or "").strip()
+            else:
+                target_message_id = str(data or "").strip()
+            if target_message_id:
+                return target_message_id
+        return ""
+
     async def _route_inbound_message(self, payload: Dict[str, Any]) -> None:
         """将 SnowLuma 入站消息转换为 Host 标准消息并注入。"""
 
@@ -658,7 +747,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             plain_text = "[unsupported]"
 
         timestamp_seconds = payload.get("time")
-        if not isinstance(timestamp_seconds, (int, float)):
+        if not isinstance(timestamp_seconds, (int, float)) or timestamp_seconds <= 0:
             timestamp_seconds = time.time()
 
         additional_config: Dict[str, Any] = {
@@ -683,7 +772,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
 
         message_id = str(payload.get("message_id") or f"snowluma-{uuid4().hex}").strip()
-        return {
+        message_dict: Dict[str, Any] = {
             "message_id": message_id,
             "timestamp": str(float(timestamp_seconds)),
             "platform": "qq",
@@ -698,6 +787,10 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             "session_id": "",
             "processed_plain_text": plain_text,
         }
+        reply_to = self._extract_reply_target_id(raw_message)
+        if reply_to:
+            message_dict["reply_to"] = reply_to
+        return message_dict
 
     async def _resolve_group_name(self, payload: Mapping[str, Any], group_id: str) -> str:
         """解析群名称，优先使用推送字段，缺失时查询 SnowLuma。"""
@@ -782,7 +875,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 continue
 
             if item_type == "reply":
-                target_message_id = str(item_data.get("id") or "").strip()
+                target_message_id = self._normalize_inbound_reply_id(item_data.get("id"))
                 if target_message_id:
                     segments.append({"type": "reply", "data": {"target_message_id": target_message_id}})
                 continue
