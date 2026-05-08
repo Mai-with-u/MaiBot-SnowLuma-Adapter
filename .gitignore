@@ -3,3 +3,5 @@ logs/**
 test/**
 **/__pycache__/**
 config.toml
+config.toml.backup
+config.toml.backup.*
