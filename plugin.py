@@ -359,14 +359,33 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             }
 
         response_data = response.get("data", {})
+        internal_message_id = str(message.get("message_id") or "").strip()
         external_message_id = ""
         if isinstance(response_data, Mapping):
             external_message_id = str(response_data.get("message_id") or "")
 
+        adapter_callbacks = []
+        if internal_message_id and external_message_id and internal_message_id != external_message_id:
+            adapter_callbacks.append(
+                {
+                    "name": "message_id_echo",
+                    "payload": {
+                        "content": {
+                            "type": "echo",
+                            "echo": internal_message_id,
+                            "actual_id": external_message_id,
+                        }
+                    },
+                }
+            )
+
         return {
             "success": True,
             "external_message_id": external_message_id or None,
-            "metadata": {"action": action_name},
+            "metadata": {
+                "action": action_name,
+                "adapter_callbacks": adapter_callbacks,
+            },
         }
 
     def _load_settings(self) -> SnowLumaAdapterSettings:
@@ -900,6 +919,26 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 plain_text_parts.append("[voice]")
                 continue
 
+            if item_type == "file":
+                file_text = self._build_inbound_file_text(item_data)
+                segments.append(
+                    {
+                        "type": "dict",
+                        "data": {
+                            "type": "file",
+                            "data": self._build_inbound_file_payload(item_data),
+                        },
+                    }
+                )
+                plain_text_parts.append(file_text)
+                continue
+
+            if item_type == "json":
+                json_text = self._build_inbound_json_card_text(item_data)
+                segments.append({"type": "text", "data": json_text})
+                plain_text_parts.append(json_text)
+                continue
+
             if item_type in {"face", "emoji"}:
                 face_id = str(item_data.get("id") or "").strip()
                 text = f"[face:{face_id}]" if face_id else "[face]"
@@ -907,11 +946,401 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 plain_text_parts.append(text)
                 continue
 
+            if item_type == "forward":
+                forward_segment = await self._build_inbound_forward_segment(item_data)
+                segments.append(forward_segment)
+                plain_text_parts.append(self._build_forward_plain_text(forward_segment))
+                continue
+
             fallback_text = f"[{item_type or 'unknown'}]"
             segments.append({"type": "text", "data": fallback_text})
             plain_text_parts.append(fallback_text)
 
         return segments, "".join(plain_text_parts), is_at, is_picture
+
+    @staticmethod
+    def _build_inbound_file_text(segment_data: Mapping[str, Any]) -> str:
+        """把 OneBot 文件段转成可读文本。"""
+
+        file_name = str(
+            segment_data.get("file")
+            or segment_data.get("name")
+            or segment_data.get("file_name")
+            or segment_data.get("filename")
+            or ""
+        ).strip()
+        file_size = str(segment_data.get("file_size") or segment_data.get("size") or "").strip()
+        file_url = str(segment_data.get("url") or segment_data.get("file_url") or "").strip()
+
+        text_parts: List[str] = []
+        if file_name:
+            text_parts.append(file_name)
+        if file_size:
+            text_parts.append(f"大小: {file_size}")
+
+        file_text = "[文件]"
+        if text_parts:
+            file_text = f"[文件] {'，'.join(text_parts)}"
+        if file_url:
+            file_text = f"{file_text}，链接: {file_url}"
+        return file_text
+
+    @staticmethod
+    def _build_inbound_file_payload(segment_data: Mapping[str, Any]) -> Dict[str, Any]:
+        """保留 OneBot 文件段的结构化信息，供复杂消息工具展开。"""
+
+        file_name = str(
+            segment_data.get("file")
+            or segment_data.get("name")
+            or segment_data.get("file_name")
+            or segment_data.get("filename")
+            or ""
+        ).strip()
+        file_size = str(segment_data.get("file_size") or segment_data.get("size") or "").strip()
+        file_url = str(segment_data.get("url") or segment_data.get("file_url") or "").strip()
+        file_id = str(segment_data.get("file_id") or segment_data.get("id") or "").strip()
+
+        payload: Dict[str, Any] = {}
+        if file_name:
+            payload["name"] = file_name
+            payload["file"] = file_name
+        if file_size:
+            payload["size"] = file_size
+            payload["file_size"] = file_size
+        if file_url:
+            payload["url"] = file_url
+        if file_id:
+            payload["file_id"] = file_id
+        return payload
+
+    def _build_inbound_json_card_text(self, segment_data: Mapping[str, Any]) -> str:
+        """把 OneBot JSON 卡片转成可读文本摘要。"""
+
+        raw_json = str(segment_data.get("data") or "").strip()
+        if not raw_json:
+            return "[json]"
+
+        try:
+            parsed_json = json.loads(raw_json)
+        except Exception:
+            return "[json]"
+
+        if not isinstance(parsed_json, Mapping):
+            return "[json]"
+
+        prompt = str(parsed_json.get("prompt") or "").strip()
+        app_name = str(parsed_json.get("app") or "").strip()
+        meta = parsed_json.get("meta", {})
+        if not isinstance(meta, Mapping):
+            meta = {}
+
+        card_parts = self._extract_json_card_parts(meta)
+        title = card_parts.get("title", "")
+        desc = card_parts.get("desc", "")
+        url = card_parts.get("url", "")
+        tag = card_parts.get("tag", "") or prompt or app_name or "json"
+
+        text_parts: List[str] = [f"[卡片:{tag}]"]
+        if title and title not in text_parts:
+            text_parts.append(title)
+        if desc and desc != title:
+            text_parts.append(desc)
+        if url:
+            text_parts.append(f"链接: {url}")
+        return " ".join(part for part in text_parts if part).strip() or "[json]"
+
+    def _extract_json_card_parts(self, meta: Mapping[str, Any]) -> Dict[str, str]:
+        """从常见 QQ JSON 卡片 meta 中提取标题、描述、链接。"""
+
+        for nested_value in meta.values():
+            if not isinstance(nested_value, Mapping):
+                continue
+
+            title = str(
+                nested_value.get("title")
+                or nested_value.get("name")
+                or nested_value.get("prompt")
+                or nested_value.get("text")
+                or ""
+            ).strip()
+            desc = str(
+                nested_value.get("desc")
+                or nested_value.get("summary")
+                or nested_value.get("forwardMessage")
+                or nested_value.get("content")
+                or ""
+            ).strip()
+            url = str(
+                nested_value.get("url")
+                or nested_value.get("jumpUrl")
+                or nested_value.get("qqdocurl")
+                or nested_value.get("musicUrl")
+                or ""
+            ).strip()
+            tag = str(nested_value.get("tag") or nested_value.get("tagName") or "").strip()
+            if title or desc or url or tag:
+                return {"title": title, "desc": desc, "url": url, "tag": tag}
+
+        return {"title": "", "desc": "", "url": "", "tag": ""}
+
+    def _build_forward_plain_text(self, forward_segment: Mapping[str, Any]) -> str:
+        """为合并转发构造可读摘要，避免上下文里只剩 ``[forward]``。"""
+
+        if forward_segment.get("type") != "forward":
+            return str(forward_segment.get("data") or "[forward]")
+
+        raw_nodes = forward_segment.get("data")
+        if not isinstance(raw_nodes, list) or not raw_nodes:
+            return "[forward]"
+
+        preview_lines: List[str] = ["【合并转发消息:"]
+        for raw_node in raw_nodes[:8]:
+            if not isinstance(raw_node, Mapping):
+                continue
+
+            sender_name = str(
+                raw_node.get("user_cardname")
+                or raw_node.get("user_nickname")
+                or raw_node.get("user_id")
+                or "未知用户"
+            )
+            content_text = self._build_forward_node_plain_text(raw_node.get("content"))
+            preview_lines.append(f"【{sender_name}】: {content_text or '[empty]'}")
+
+        total_count = len(raw_nodes)
+        if total_count > 8:
+            preview_lines.append(f"... 其余 {total_count - 8} 条已省略")
+        preview_lines.append("】")
+        return "\n".join(preview_lines)
+
+    def _build_forward_node_plain_text(self, raw_content: Any) -> str:
+        """把单个转发节点的 Host 消息段渲染成轻量文本。"""
+
+        if not isinstance(raw_content, list):
+            return ""
+
+        text_parts: List[str] = []
+        for segment in raw_content:
+            if not isinstance(segment, Mapping):
+                continue
+
+            segment_type = str(segment.get("type") or "").strip()
+            segment_data = segment.get("data")
+            if segment_type == "text":
+                text_parts.append(str(segment_data or ""))
+                continue
+
+            if segment_type == "at":
+                if isinstance(segment_data, Mapping):
+                    target_name = str(
+                        segment_data.get("target_user_cardname")
+                        or segment_data.get("target_user_nickname")
+                        or segment_data.get("target_user_id")
+                        or ""
+                    ).strip()
+                else:
+                    target_name = str(segment_data or "").strip()
+                if target_name:
+                    text_parts.append(f"@{target_name}")
+                continue
+
+            if segment_type == "image":
+                text_parts.append("[image]")
+                continue
+
+            if segment_type == "emoji":
+                text_parts.append("[emoji]")
+                continue
+
+            if segment_type == "voice":
+                text_parts.append("[voice]")
+                continue
+
+            if segment_type == "reply":
+                text_parts.append("[reply]")
+                continue
+
+            if segment_type == "forward":
+                text_parts.append("[forward]")
+                continue
+
+            if segment_type:
+                text_parts.append(f"[{segment_type}]")
+
+        return "".join(text_parts)
+
+    async def _build_inbound_forward_segment(self, segment_data: Mapping[str, Any]) -> Dict[str, Any]:
+        """展开 OneBot 合并转发消息段。"""
+
+        messages = self._extract_forward_messages(segment_data)
+        if messages is None:
+            forward_id = str(segment_data.get("id") or "").strip()
+            if not forward_id:
+                return {"type": "text", "data": "[forward]"}
+
+            try:
+                response = await self._call_action("get_forward_msg", {"message_id": forward_id, "id": forward_id})
+            except Exception as exc:
+                self.ctx.logger.debug(f"SnowLuma 获取合并转发详情失败: id={forward_id} error={exc}")
+                return {"type": "text", "data": "[forward]"}
+
+            messages = self._extract_forward_messages(response)
+
+        if not isinstance(messages, list):
+            return {"type": "text", "data": "[forward]"}
+
+        forward_nodes = await self._build_inbound_forward_nodes(messages)
+        if not forward_nodes:
+            return {"type": "text", "data": "[forward]"}
+
+        return {"type": "forward", "data": forward_nodes}
+
+    def _extract_forward_messages(self, payload: Mapping[str, Any]) -> Optional[List[Any]]:
+        """从合并转发载荷中提取节点列表。"""
+
+        direct_messages = payload.get("messages")
+        if isinstance(direct_messages, list):
+            return direct_messages
+
+        direct_content = payload.get("content")
+        if isinstance(direct_content, list):
+            return direct_content
+
+        nested_data = payload.get("data")
+        if isinstance(nested_data, Mapping):
+            nested_messages = nested_data.get("messages")
+            if isinstance(nested_messages, list):
+                return nested_messages
+
+            nested_content = nested_data.get("content")
+            if isinstance(nested_content, list):
+                return nested_content
+
+        return None
+
+    async def _build_inbound_forward_nodes(self, messages: List[Any]) -> List[Dict[str, Any]]:
+        """转换 SnowLuma/NapCat 返回的合并转发节点。"""
+
+        forward_nodes: List[Dict[str, Any]] = []
+        for forward_message in messages:
+            if not isinstance(forward_message, Mapping):
+                continue
+
+            raw_content = self._extract_forward_node_content(forward_message)
+            content_segments, _, _, _ = await self._convert_inbound_segments(raw_content)
+            sender = self._extract_forward_node_sender(forward_message)
+            node_data = forward_message.get("data", {})
+            if not isinstance(node_data, Mapping):
+                node_data = {}
+
+            node_payload = self._extract_forward_node_payload(forward_message)
+            forward_nodes.append(
+                {
+                    "user_id": str(
+                        sender.get("user_id")
+                        or sender.get("uin")
+                        or sender.get("id")
+                        or node_payload.get("user_id")
+                        or node_payload.get("uin")
+                        or node_payload.get("id")
+                        or node_data.get("user_id")
+                        or node_data.get("uin")
+                        or node_data.get("id")
+                        or ""
+                    ).strip()
+                    or None,
+                    "user_nickname": str(
+                        sender.get("nickname")
+                        or sender.get("name")
+                        or sender.get("card")
+                        or node_payload.get("nickname")
+                        or node_payload.get("name")
+                        or node_payload.get("card")
+                        or node_data.get("nickname")
+                        or node_data.get("name")
+                        or node_data.get("card")
+                        or "未知用户"
+                    ),
+                    "user_cardname": str(
+                        sender.get("card") or node_payload.get("card") or node_data.get("card") or ""
+                    ).strip()
+                    or None,
+                    "message_id": str(
+                        forward_message.get("message_id")
+                        or forward_message.get("id")
+                        or node_payload.get("message_id")
+                        or node_payload.get("id")
+                        or node_data.get("id")
+                        or uuid4().hex
+                    ),
+                    "content": content_segments or [{"type": "text", "data": "[empty]"}],
+                }
+            )
+        return forward_nodes
+
+    @staticmethod
+    def _extract_forward_node_payload(forward_message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """提取 OneBot ``node`` 段内层 ``data`` 作为节点主体。"""
+
+        if str(forward_message.get("type") or "").strip() == "node":
+            node_data = forward_message.get("data", {})
+            if isinstance(node_data, Mapping):
+                return node_data
+        return forward_message
+
+    @staticmethod
+    def _extract_forward_node_content(forward_message: Mapping[str, Any]) -> Any:
+        """提取单个合并转发节点中的消息段列表。"""
+
+        direct_content = forward_message.get("content")
+        if isinstance(direct_content, list):
+            return direct_content
+
+        direct_message = forward_message.get("message")
+        if isinstance(direct_message, list):
+            return direct_message
+
+        node_data = forward_message.get("data", {})
+        if not isinstance(node_data, Mapping):
+            return []
+
+        nested_content = node_data.get("content")
+        if isinstance(nested_content, list):
+            return nested_content
+
+        nested_message = node_data.get("message")
+        if isinstance(nested_message, list):
+            return nested_message
+
+        return []
+
+    @staticmethod
+    def _extract_forward_node_sender(forward_message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """提取单个合并转发节点的发送者信息。"""
+
+        sender = forward_message.get("sender", {})
+        if isinstance(sender, Mapping):
+            return sender
+        if isinstance(sender, str) and sender.strip():
+            return {"nickname": sender.strip(), "name": sender.strip()}
+
+        node_data = forward_message.get("data", {})
+        if not isinstance(node_data, Mapping):
+            return {}
+
+        normalized_sender: Dict[str, Any] = {}
+        user_id = str(node_data.get("user_id") or node_data.get("uin") or node_data.get("id") or "").strip()
+        nickname = str(node_data.get("nickname") or node_data.get("name") or node_data.get("card") or "").strip()
+        cardname = str(node_data.get("card") or "").strip()
+        if user_id:
+            normalized_sender["user_id"] = user_id
+            normalized_sender["uin"] = user_id
+        if nickname:
+            normalized_sender["nickname"] = nickname
+            normalized_sender["name"] = nickname
+        if cardname:
+            normalized_sender["card"] = cardname
+        return normalized_sender
 
     async def _build_inbound_binary_segment(
         self,
@@ -1094,7 +1523,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         return {"type": segment_type, "data": {"file": file_reference}}
 
     @staticmethod
-    def _normalize_outbound_reply_id(message_id: str) -> Optional[int]:
+    def _normalize_outbound_reply_id(message_id: str) -> Optional[str]:
         """把内部回复目标 ID 转成 SnowLuma 可接受的 OneBot 消息 ID。"""
 
         normalized_message_id = str(message_id or "").strip()
@@ -1108,7 +1537,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         if reply_id == 0:
             return None
-        return reply_id
+        return normalized_message_id
 
     @staticmethod
     def _encode_binary(binary_data: bytes) -> str:
