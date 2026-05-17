@@ -20,6 +20,32 @@ SUPPORTED_CONFIG_VERSION = "1.0.0"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 
 
+def _schema_i18n(
+    *,
+    label_en: str,
+    label_ja: str,
+    hint_en: Optional[str] = None,
+    hint_ja: Optional[str] = None,
+    placeholder_en: Optional[str] = None,
+    placeholder_ja: Optional[str] = None,
+) -> Dict[str, Dict[str, str]]:
+    """构造 WebUI 配置项多语言说明，保留外层中文字段兼容旧格式。"""
+
+    i18n: Dict[str, Dict[str, str]] = {
+        "en_US": {"label": label_en},
+        "ja_JP": {"label": label_ja},
+    }
+    if hint_en is not None:
+        i18n["en_US"]["hint"] = hint_en
+    if hint_ja is not None:
+        i18n["ja_JP"]["hint"] = hint_ja
+    if placeholder_en is not None:
+        i18n["en_US"]["placeholder"] = placeholder_en
+    if placeholder_ja is not None:
+        i18n["ja_JP"]["placeholder"] = placeholder_ja
+    return i18n
+
+
 class SnowLumaPluginSection(PluginConfigBase):
     """插件开关配置。"""
 
@@ -32,6 +58,12 @@ class SnowLumaPluginSection(PluginConfigBase):
         json_schema_extra={
             "label": "启用适配器",
             "hint": "关闭时插件只注册消息网关，不会主动连接 SnowLuma。",
+            "i18n": _schema_i18n(
+                label_en="Enable adapter",
+                label_ja="アダプターを有効化",
+                hint_en="When disabled, the plugin only registers the message gateway and will not connect to SnowLuma.",
+                hint_ja="無効にすると、プラグインはメッセージゲートウェイの登録のみを行い、SnowLuma へ接続しません。",
+            ),
             "order": 0,
         },
     )
@@ -41,6 +73,7 @@ class SnowLumaPluginSection(PluginConfigBase):
         json_schema_extra={
             "disabled": True,
             "hidden": True,
+            "i18n": _schema_i18n(label_en="Config version", label_ja="設定バージョン"),
             "label": "配置版本",
             "order": 99,
         },
@@ -56,18 +89,47 @@ class SnowLumaClientSection(PluginConfigBase):
     server: str = Field(
         default="127.0.0.1",
         description="SnowLuma WebSocket 服务地址。",
-        json_schema_extra={"label": "服务地址", "order": 0, "placeholder": "127.0.0.1"},
+        json_schema_extra={
+            "i18n": _schema_i18n(
+                label_en="Server address",
+                label_ja="サーバーアドレス",
+                hint_en="Usually the host running SnowLuma. Defaults to the local loopback address.",
+                hint_ja="通常は SnowLuma を実行しているホストです。既定ではローカルのループバックアドレスを使用します。",
+                placeholder_en="127.0.0.1",
+                placeholder_ja="127.0.0.1",
+            ),
+            "label": "服务地址",
+            "order": 0,
+            "placeholder": "127.0.0.1",
+        },
     )
     port: int = Field(
         default=3001,
         description="SnowLuma WebSocket 服务端口。",
-        json_schema_extra={"label": "端口", "order": 1},
+        json_schema_extra={
+            "i18n": _schema_i18n(
+                label_en="Port",
+                label_ja="ポート",
+                hint_en="Keep this consistent with the SnowLuma WebSocket listening port.",
+                hint_ja="SnowLuma WebSocket の待受ポートと一致させてください。",
+            ),
+            "label": "端口",
+            "order": 1,
+        },
     )
     token: str = Field(
         default="",
         description="SnowLuma 访问令牌。",
         json_schema_extra={
             "label": "访问令牌",
+            "i18n": _schema_i18n(
+                label_en="Access token",
+                label_ja="アクセストークン",
+                hint_en="If SnowLuma access token verification is enabled, enter the same token here.",
+                hint_ja="SnowLuma でアクセストークン検証を有効にしている場合は、同じ token をここに入力してください。",
+                placeholder_en="Optional",
+                placeholder_ja="空欄可",
+            ),
             "input_type": "password",
             "order": 2,
             "placeholder": "可留空",
@@ -76,17 +138,46 @@ class SnowLumaClientSection(PluginConfigBase):
     connection_id: str = Field(
         default="",
         description="可选连接标识，用于区分多条适配器链路。",
-        json_schema_extra={"label": "连接标识", "order": 3},
+        json_schema_extra={
+            "i18n": _schema_i18n(
+                label_en="Connection ID",
+                label_ja="接続識別子",
+                hint_en="When multiple SnowLuma connections exist, use this as the routing scope identifier.",
+                hint_ja="複数の SnowLuma 接続がある場合、ルーティングスコープの識別子として使用できます。",
+            ),
+            "label": "连接标识",
+            "order": 3,
+        },
     )
     reconnect_delay_sec: float = Field(
         default=5.0,
         description="连接断开后的重连等待时间，单位为秒。",
-        json_schema_extra={"label": "重连等待", "order": 4, "step": 1},
+        json_schema_extra={
+            "i18n": _schema_i18n(
+                label_en="Reconnect delay (sec)",
+                label_ja="再接続待機（秒）",
+                hint_en="After a disconnect, wait this long before trying to reconnect.",
+                hint_ja="接続が切断された後、再接続を試すまでこの時間待機します。",
+            ),
+            "label": "重连等待",
+            "order": 4,
+            "step": 1,
+        },
     )
     action_timeout_sec: float = Field(
         default=10.0,
         description="调用 SnowLuma 动作接口的超时时间，单位为秒。",
-        json_schema_extra={"label": "动作超时", "order": 5, "step": 1},
+        json_schema_extra={
+            "i18n": _schema_i18n(
+                label_en="Action timeout (sec)",
+                label_ja="アクションタイムアウト（秒）",
+                hint_en="Actions such as sending messages or querying info fail after this timeout.",
+                hint_ja="メッセージ送信や情報取得などのアクションは、この時間を超えるとエラーになります。",
+            ),
+            "label": "动作超时",
+            "order": 5,
+            "step": 1,
+        },
     )
 
     def build_ws_url(self) -> str:
@@ -109,6 +200,12 @@ class SnowLumaChatSection(PluginConfigBase):
         description="是否启用群聊与私聊名单过滤。",
         json_schema_extra={
             "hint": "关闭后将忽略 group_list 和 private_list，仅保留 ban_user_id 规则。",
+            "i18n": _schema_i18n(
+                label_en="Enable chat list filter",
+                label_ja="チャットリストフィルターを有効化",
+                hint_en="When disabled, group_list and private_list are ignored; only ban_user_id rules remain.",
+                hint_ja="無効にすると、group_list と private_list を無視し、ban_user_id ルールのみを適用します。",
+            ),
             "label": "启用聊天名单过滤",
             "order": 0,
         },
@@ -118,6 +215,12 @@ class SnowLumaChatSection(PluginConfigBase):
         description="是否记录未通过聊天名单过滤而被丢弃的消息。",
         json_schema_extra={
             "hint": "关闭后不记录群聊/私聊名单丢弃日志，默认关闭以减少刷屏。",
+            "i18n": _schema_i18n(
+                label_en="Show dropped chat-list logs",
+                label_ja="チャットリストで破棄されたログを表示",
+                hint_en="When disabled, dropped group/private chat-list logs are not recorded. Default off to reduce log noise.",
+                hint_ja="無効にすると、チャットリストで破棄されたグループ/個人チャットのログを記録しません。ログの増加を抑えるため既定ではオフです。",
+            ),
             "label": "显示聊天名单丢弃日志",
             "order": 1,
         },
@@ -127,6 +230,12 @@ class SnowLumaChatSection(PluginConfigBase):
         description="群聊名单模式。",
         json_schema_extra={
             "hint": "白名单模式只接收列表内群聊，黑名单模式则忽略列表内群聊。",
+            "i18n": _schema_i18n(
+                label_en="Group list mode",
+                label_ja="グループリストモード",
+                hint_en="Whitelist mode only accepts listed groups; blacklist mode ignores listed groups.",
+                hint_ja="ホワイトリストではリスト内のグループのみ受信し、ブラックリストではリスト内のグループを無視します。",
+            ),
             "label": "群聊名单模式",
             "order": 2,
         },
@@ -136,6 +245,14 @@ class SnowLumaChatSection(PluginConfigBase):
         description="群聊名单中的群号列表。",
         json_schema_extra={
             "hint": "群号会被统一转换为字符串并自动去重。",
+            "i18n": _schema_i18n(
+                label_en="Group list",
+                label_ja="グループリスト",
+                hint_en="Group IDs are normalized to strings and deduplicated automatically.",
+                hint_ja="グループ ID は文字列に正規化され、自動的に重複排除されます。",
+                placeholder_en="Enter group ID",
+                placeholder_ja="グループ ID を入力",
+            ),
             "label": "群聊名单",
             "order": 3,
             "placeholder": "请输入群号",
@@ -146,6 +263,12 @@ class SnowLumaChatSection(PluginConfigBase):
         description="私聊名单模式。",
         json_schema_extra={
             "hint": "白名单模式只接收列表内私聊，黑名单模式则忽略列表内私聊。",
+            "i18n": _schema_i18n(
+                label_en="Private list mode",
+                label_ja="個人チャットリストモード",
+                hint_en="Whitelist mode only accepts listed private chats; blacklist mode ignores listed private chats.",
+                hint_ja="ホワイトリストではリスト内の個人チャットのみ受信し、ブラックリストではリスト内の個人チャットを無視します。",
+            ),
             "label": "私聊名单模式",
             "order": 4,
         },
@@ -155,6 +278,14 @@ class SnowLumaChatSection(PluginConfigBase):
         description="私聊名单中的用户 ID 列表。",
         json_schema_extra={
             "hint": "用户 ID 会被统一转换为字符串并自动去重。",
+            "i18n": _schema_i18n(
+                label_en="Private list",
+                label_ja="個人チャットリスト",
+                hint_en="User IDs are normalized to strings and deduplicated automatically.",
+                hint_ja="ユーザー ID は文字列に正規化され、自動的に重複排除されます。",
+                placeholder_en="Enter user ID",
+                placeholder_ja="ユーザー ID を入力",
+            ),
             "label": "私聊名单",
             "order": 5,
             "placeholder": "请输入用户 ID",
@@ -165,6 +296,14 @@ class SnowLumaChatSection(PluginConfigBase):
         description="全局屏蔽的用户 ID 列表。",
         json_schema_extra={
             "hint": "这些用户的消息会在进入 Host 之前被直接丢弃。",
+            "i18n": _schema_i18n(
+                label_en="Globally blocked users",
+                label_ja="全体ブロックユーザー",
+                hint_en="Messages from these users are dropped before entering the Host.",
+                hint_ja="これらのユーザーからのメッセージは Host に入る前に破棄されます。",
+                placeholder_en="Enter user ID",
+                placeholder_ja="ユーザー ID を入力",
+            ),
             "label": "全局屏蔽用户",
             "order": 6,
             "placeholder": "请输入用户 ID",
@@ -175,6 +314,12 @@ class SnowLumaChatSection(PluginConfigBase):
         description="是否屏蔽 QQ 官方机器人消息。",
         json_schema_extra={
             "hint": "SnowLuma 推送中能识别出官方机器人标记时会丢弃对应消息。",
+            "i18n": _schema_i18n(
+                label_en="Block official bots",
+                label_ja="公式 Bot をブロック",
+                hint_en="When SnowLuma push events identify an official bot marker, matching messages are dropped.",
+                hint_ja="SnowLuma のプッシュ内で公式 Bot のマーカーを識別できる場合、該当メッセージを破棄します。",
+            ),
             "label": "屏蔽官方机器人",
             "order": 7,
         },
@@ -220,6 +365,12 @@ class SnowLumaFilterSection(PluginConfigBase):
         description="是否忽略机器人自身发送的消息。",
         json_schema_extra={
             "hint": "建议保持开启，避免机器人处理自己刚刚发出的消息。",
+            "i18n": _schema_i18n(
+                label_en="Ignore self messages",
+                label_ja="自身のメッセージを無視",
+                hint_en="Recommended on to avoid the bot processing messages it just sent.",
+                hint_ja="Bot が自分で送信した直後のメッセージを処理しないよう、有効のままにすることを推奨します。",
+            ),
             "label": "忽略自身消息",
             "order": 0,
         },
