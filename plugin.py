@@ -16,7 +16,7 @@ import time
 
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+SUPPORTED_CONFIG_VERSION = "1.0.1"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 
 
@@ -65,6 +65,21 @@ class SnowLumaPluginSection(PluginConfigBase):
                 hint_ja="無効にすると、プラグインはメッセージゲートウェイの登録のみを行い、SnowLuma へ接続しません。",
             ),
             "order": 0,
+        },
+    )
+    enable_ada_debug_raw_message_log: bool = Field(
+        default=False,
+        description="是否启用 Ada 调试模式，记录 SnowLuma 入站原始消息段。",
+        json_schema_extra={
+            "label": "Ada 调试原始消息段",
+            "hint": "仅排查消息段结构问题时开启；开启后会以 info 级别记录每条入站消息的原始 message 字段。",
+            "i18n": _schema_i18n(
+                label_en="Ada raw message debug",
+                label_ja="Ada 生メッセージデバッグ",
+                hint_en="Enable only while debugging segment structure; logs each inbound raw message field at info level.",
+                hint_ja="セグメント構造を調査するときだけ有効にしてください。入站 message フィールドを info レベルで記録します。",
+            ),
+            "order": 1,
         },
     )
     config_version: str = Field(
@@ -911,7 +926,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         user_nickname = str(sender.get("nickname") or sender.get("card") or user_id).strip() or user_id
         user_cardname = str(sender.get("card") or "").strip() or None
 
-        raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(payload.get("message"))
+        inbound_raw_message = payload.get("message")
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 入站原始消息段: "
+                f"message_id={payload.get('message_id')!r} "
+                f"message={json.dumps(inbound_raw_message, ensure_ascii=False, default=str)}"
+            )
+
+        raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(inbound_raw_message)
         if not raw_message:
             raw_message = [{"type": "text", "data": "[unsupported]"}]
             plain_text = "[unsupported]"
