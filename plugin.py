@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -422,6 +423,8 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self._response_pool: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
         self._connected_account_id: str = ""
         self._group_name_cache: Dict[str, str] = {}
+        self._group_member_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._user_name_cache: Dict[str, Dict[str, str]] = {}
 
     async def on_load(self) -> None:
         """插件加载后按配置启动连接。"""
@@ -1020,6 +1023,115 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         return f"group_{group_id}"
 
+    async def _resolve_group_member_names(self, group_id: str, user_id: str) -> Dict[str, str]:
+        """通过 SnowLuma 查询群成员名片和昵称。"""
+
+        normalized_group_id = str(group_id or "").strip()
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_group_id or not normalized_user_id:
+            return {}
+
+        cache_key = (normalized_group_id, normalized_user_id)
+        if cache_key in self._group_member_cache:
+            return self._group_member_cache[cache_key]
+
+        try:
+            response = await self._call_action(
+                "get_group_member_info",
+                {
+                    "group_id": self._normalize_positive_id(normalized_group_id, "group_id"),
+                    "user_id": self._normalize_positive_id(normalized_user_id, "user_id"),
+                    "no_cache": True,
+                },
+            )
+        except Exception as exc:
+            self.ctx.logger.debug(
+                "SnowLuma 查询转发节点发送者信息失败: "
+                f"group_id={normalized_group_id} user_id={normalized_user_id} error={exc}"
+            )
+            self._group_member_cache[cache_key] = {}
+            return {}
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 转发节点群成员信息响应: "
+                f"group_id={normalized_group_id!r} user_id={normalized_user_id!r} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        member_info = response.get("data", response)
+        if not isinstance(member_info, Mapping):
+            self._group_member_cache[cache_key] = {}
+            return await self._resolve_user_names(normalized_user_id)
+
+        resolved_names = self._extract_member_name_fields(member_info)
+        if not resolved_names:
+            resolved_names = await self._resolve_user_names(normalized_user_id)
+
+        self._group_member_cache[cache_key] = resolved_names
+        return resolved_names
+
+    async def _resolve_user_names(self, user_id: str) -> Dict[str, str]:
+        """通过 SnowLuma 查询用户基础昵称，作为群成员信息缺失时的补充。"""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return {}
+        if normalized_user_id in self._user_name_cache:
+            return self._user_name_cache[normalized_user_id]
+
+        try:
+            response = await self._call_action(
+                "get_stranger_info",
+                {
+                    "user_id": self._normalize_positive_id(normalized_user_id, "user_id"),
+                    "no_cache": True,
+                },
+            )
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 查询转发节点用户昵称失败: user_id={normalized_user_id} error={exc}")
+            self._user_name_cache[normalized_user_id] = {}
+            return {}
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 转发节点用户信息响应: "
+                f"user_id={normalized_user_id!r} response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        user_info = response.get("data", response)
+        if not isinstance(user_info, Mapping):
+            self._user_name_cache[normalized_user_id] = {}
+            return {}
+
+        resolved_names = self._extract_member_name_fields(user_info)
+        self._user_name_cache[normalized_user_id] = resolved_names
+        return resolved_names
+
+    @staticmethod
+    def _extract_member_name_fields(member_info: Mapping[str, Any]) -> Dict[str, str]:
+        """从 SnowLuma/NapCat 用户信息字段中提取名片和昵称。"""
+
+        resolved_names: Dict[str, str] = {}
+        cardname = str(
+            member_info.get("card")
+            or member_info.get("card_name")
+            or member_info.get("group_card")
+            or member_info.get("remark")
+            or ""
+        ).strip()
+        nickname = str(
+            member_info.get("nickname")
+            or member_info.get("nick")
+            or member_info.get("name")
+            or ""
+        ).strip()
+        if cardname:
+            resolved_names["card"] = cardname
+        if nickname:
+            resolved_names["nickname"] = nickname
+        return resolved_names
+
     async def _convert_inbound_segments(self, raw_message: Any) -> Tuple[List[Dict[str, Any]], str, bool, bool]:
         """转换 OneBot 消息段为 Host 消息段。"""
 
@@ -1080,6 +1192,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     "emoji" if is_emoji_segment else "image",
                     image_ref,
                     "[emoji]" if is_emoji_segment else "[image]",
+                    item_data,
                 )
                 segments.append(image_segment)
                 plain_text_parts.append("[image]")
@@ -1088,7 +1201,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
             if item_type == "record":
                 voice_ref = str(item_data.get("url") or item_data.get("file") or "").strip()
-                voice_segment = await self._build_inbound_binary_segment("voice", voice_ref, "[voice]")
+                voice_segment = await self._build_inbound_binary_segment("voice", voice_ref, "[voice]", item_data)
                 segments.append(voice_segment)
                 plain_text_parts.append("[voice]")
                 continue
@@ -1358,6 +1471,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 self.ctx.logger.debug(f"SnowLuma 获取合并转发详情失败: id={forward_id} error={exc}")
                 return {"type": "text", "data": "[forward]"}
 
+            if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+                self.ctx.logger.info(
+                    "SnowLuma 合并转发详情响应: "
+                    f"id={forward_id!r} response={json.dumps(response, ensure_ascii=False, default=str)}"
+                )
+
             messages = self._extract_forward_messages(response)
 
         if not isinstance(messages, list):
@@ -1408,37 +1527,44 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 node_data = {}
 
             node_payload = self._extract_forward_node_payload(forward_message)
+            node_user_id = str(
+                sender.get("user_id")
+                or sender.get("uin")
+                or sender.get("id")
+                or node_payload.get("user_id")
+                or node_payload.get("uin")
+                or node_payload.get("id")
+                or node_data.get("user_id")
+                or node_data.get("uin")
+                or node_data.get("id")
+                or ""
+            ).strip()
+            node_cardname = str(sender.get("card") or node_payload.get("card") or node_data.get("card") or "").strip()
+            node_nickname = str(
+                sender.get("nickname")
+                or sender.get("name")
+                or node_payload.get("nickname")
+                or node_payload.get("name")
+                or node_data.get("nickname")
+                or node_data.get("name")
+                or ""
+            ).strip()
+            node_group_id = str(
+                forward_message.get("group_id")
+                or node_payload.get("group_id")
+                or node_data.get("group_id")
+                or ""
+            ).strip()
+            if node_user_id and node_group_id and (not node_cardname or not node_nickname):
+                resolved_names = await self._resolve_group_member_names(node_group_id, node_user_id)
+                node_cardname = node_cardname or resolved_names.get("card", "")
+                node_nickname = node_nickname or resolved_names.get("nickname", "")
+
             forward_nodes.append(
                 {
-                    "user_id": str(
-                        sender.get("user_id")
-                        or sender.get("uin")
-                        or sender.get("id")
-                        or node_payload.get("user_id")
-                        or node_payload.get("uin")
-                        or node_payload.get("id")
-                        or node_data.get("user_id")
-                        or node_data.get("uin")
-                        or node_data.get("id")
-                        or ""
-                    ).strip()
-                    or None,
-                    "user_nickname": str(
-                        sender.get("nickname")
-                        or sender.get("name")
-                        or sender.get("card")
-                        or node_payload.get("nickname")
-                        or node_payload.get("name")
-                        or node_payload.get("card")
-                        or node_data.get("nickname")
-                        or node_data.get("name")
-                        or node_data.get("card")
-                        or "未知用户"
-                    ),
-                    "user_cardname": str(
-                        sender.get("card") or node_payload.get("card") or node_data.get("card") or ""
-                    ).strip()
-                    or None,
+                    "user_id": node_user_id or None,
+                    "user_nickname": node_nickname or node_user_id or "未知用户",
+                    "user_cardname": node_cardname or None,
                     "message_id": str(
                         forward_message.get("message_id")
                         or forward_message.get("id")
@@ -1521,10 +1647,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         segment_type: str,
         file_reference: str,
         fallback_text: str,
+        segment_data: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """构造 Host 可识别的入站媒体段。"""
 
         binary_data = await self._load_binary_reference(file_reference)
+        if not binary_data and segment_data is not None:
+            binary_data = await self._load_binary_from_segment_data(segment_type, segment_data)
         if not binary_data:
             self.ctx.logger.debug(f"SnowLuma 媒体下载失败，降级为文本: type={segment_type} ref={file_reference[:120]}")
             return {"type": "text", "data": fallback_text}
@@ -1561,6 +1690,92 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             except Exception as exc:
                 self.ctx.logger.debug(f"SnowLuma 下载媒体失败: {exc}")
                 return b""
+
+        try:
+            reference_path = Path(normalized_reference)
+            if reference_path.is_file():
+                return await asyncio.to_thread(reference_path.read_bytes)
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 读取本地媒体失败: path={normalized_reference[:120]} error={exc}")
+            return b""
+
+        return b""
+
+    async def _load_binary_from_segment_data(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
+        """从媒体段的备用字段或 OneBot 动作中加载二进制内容。"""
+
+        for field_name in ("base64", "data"):
+            raw_value = segment_data.get(field_name)
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            normalized_value = raw_value.strip()
+            if normalized_value.startswith("base64://"):
+                normalized_value = normalized_value.removeprefix("base64://")
+            try:
+                return base64.b64decode(normalized_value, validate=True)
+            except Exception:
+                continue
+
+        for field_name in ("url", "path", "file_path"):
+            binary_data = await self._load_binary_reference(str(segment_data.get(field_name) or ""))
+            if binary_data:
+                return binary_data
+
+        file_name = str(segment_data.get("file") or segment_data.get("file_id") or segment_data.get("id") or "").strip()
+        if not file_name:
+            return b""
+
+        action_name = "get_record" if segment_type == "voice" else "get_image"
+        params: Dict[str, Any] = {"file": file_name}
+        if segment_type == "voice":
+            params["out_format"] = "mp3"
+
+        try:
+            response = await self._call_action(action_name, params)
+        except Exception as exc:
+            self.ctx.logger.debug(
+                f"SnowLuma 通过动作加载媒体失败: action={action_name} type={segment_type} file={file_name} error={exc}"
+            )
+            return b""
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 媒体动作响应: "
+                f"action={action_name!r} type={segment_type!r} file={file_name!r} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        response_data = response.get("data", response)
+        if isinstance(response_data, str):
+            binary_data = await self._load_binary_reference(response_data)
+            if binary_data:
+                return binary_data
+            normalized_value = response_data.strip()
+            if normalized_value.startswith("base64://"):
+                normalized_value = normalized_value.removeprefix("base64://")
+            try:
+                return base64.b64decode(normalized_value, validate=True)
+            except Exception:
+                return b""
+        if not isinstance(response_data, Mapping):
+            return b""
+
+        for field_name in ("base64", "data"):
+            raw_value = response_data.get(field_name)
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            normalized_value = raw_value.strip()
+            if normalized_value.startswith("base64://"):
+                normalized_value = normalized_value.removeprefix("base64://")
+            try:
+                return base64.b64decode(normalized_value, validate=True)
+            except Exception:
+                continue
+
+        for field_name in ("url", "path", "file_path", "file"):
+            binary_data = await self._load_binary_reference(str(response_data.get(field_name) or ""))
+            if binary_data:
+                return binary_data
 
         return b""
 
