@@ -6,7 +6,8 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
-from maibot_sdk import API, Field, MaiBotPlugin, MessageGateway, PluginConfigBase
+from maibot_sdk import API, Field, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
 from pydantic import field_validator
 
 import asyncio
@@ -17,8 +18,9 @@ import time
 
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.1"
+SUPPORTED_CONFIG_VERSION = "1.0.2"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
+PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
 
 
 def _schema_i18n(
@@ -81,6 +83,27 @@ class SnowLumaPluginSection(PluginConfigBase):
                 hint_ja="セグメント構造を調査するときだけ有効にしてください。入站 message フィールドを info レベルで記録します。",
             ),
             "order": 1,
+        },
+    )
+    enable_private_chat_tool: bool = Field(
+        default=False,
+        description="是否启用主动开启私聊工具。",
+        json_schema_extra={
+            "label": "启用主动私聊工具",
+            "hint": "开启后，模型可调用工具向指定用户发送首条私聊消息，并在 15 分钟内绕过私聊名单过滤。",
+            "i18n": _schema_i18n(
+                label_en="Enable private chat tool",
+                label_ja="個人チャット開始ツールを有効化",
+                hint_en=(
+                    "When enabled, the model can use a tool to send the first private message to a user "
+                    "and bypass private chat-list filtering for 15 minutes."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルは指定ユーザーへ最初の個人メッセージを送信し、"
+                    "15 分間だけ個人チャットリストのフィルターを回避できます。"
+                ),
+            ),
+            "order": 2,
         },
     )
     config_version: str = Field(
@@ -425,10 +448,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self._group_name_cache: Dict[str, str] = {}
         self._group_member_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._user_name_cache: Dict[str, Dict[str, str]] = {}
+        self._private_chat_bypass_expires_at: Dict[str, float] = {}
 
     async def on_load(self) -> None:
         """插件加载后按配置启动连接。"""
 
+        await self._sync_private_chat_tool_component_state()
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
@@ -445,6 +470,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self.set_plugin_config(config_data)
         if version:
             self.ctx.logger.debug(f"SnowLuma 适配器收到配置更新: {version}")
+        await self._sync_private_chat_tool_component_state()
         await self._restart_connection_if_needed()
 
     @API("adapter.napcat.group.get_group_member_info", description="获取群成员信息", version="1", public=True)
@@ -480,6 +506,187 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 "duration": normalized_duration,
             },
         )
+
+    @Tool(
+        "open_private_chat",
+        description=(
+            "向指定 QQ 用户发送一条私聊消息，用于主动开启私聊。"
+            "仅在 SnowLuma 配置 enable_private_chat_tool=true 时可用；"
+            "发送成功后，该用户在 15 分钟内的私聊入站消息会绕过私聊黑白名单过滤。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="user_id",
+                param_type=ToolParamType.STRING,
+                description="要开启私聊的 QQ 用户 ID，必须是正整数。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="message",
+                param_type=ToolParamType.STRING,
+                description="要发送给该用户的第一条私聊消息。",
+                required=True,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_open_private_chat(
+        self,
+        user_id: Any = "",
+        message: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """主动向指定用户发送私聊消息，并临时放行该私聊。"""
+
+        del kwargs
+
+        settings = self._load_settings()
+
+        if self._ws is None:
+            return {"success": False, "error": "SnowLuma WebSocket 尚未连接"}
+
+        try:
+            normalized_user_id_int = self._normalize_positive_id(user_id, "user_id")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        normalized_user_id = str(normalized_user_id_int)
+
+        normalized_message = str(message or "").strip()
+        if not normalized_message:
+            return {"success": False, "error": "私聊消息不能为空"}
+
+        open_session_result = await self.ctx.chat.open_session(
+            platform="qq",
+            chat_type="private",
+            user_id=normalized_user_id,
+            account_id=self._connected_account_id,
+            scope=settings.luma_client.connection_id,
+        )
+        if not isinstance(open_session_result, Mapping) or not bool(open_session_result.get("success", False)):
+            error = ""
+            if isinstance(open_session_result, Mapping):
+                error = str(open_session_result.get("error") or "").strip()
+            return {
+                "success": False,
+                "error": error or "打开私聊会话失败",
+                "open_session_result": open_session_result,
+            }
+
+        response = await self._call_action(
+            "send_msg",
+            {
+                "message_type": "private",
+                "user_id": normalized_user_id_int,
+                "message": [{"type": "text", "data": {"text": normalized_message}}],
+            },
+        )
+        send_error = self._extract_action_error(response)
+        if send_error:
+            return {
+                "success": False,
+                "error": send_error,
+                "response": response,
+            }
+
+        expires_at = self._grant_private_chat_bypass(normalized_user_id)
+        message_id = self._extract_action_message_id(response)
+        self.ctx.logger.info(
+            f"SnowLuma 已主动开启私聊: user_id={normalized_user_id} "
+            f"message_id={message_id or '<unknown>'} bypass_seconds={PRIVATE_CHAT_TOOL_BYPASS_SECONDS}"
+        )
+        return {
+            "success": True,
+            "content": (
+                f"已向用户 {normalized_user_id} 发送私聊消息，"
+                f"并在 {PRIVATE_CHAT_TOOL_BYPASS_SECONDS // 60} 分钟内临时放行该私聊。"
+            ),
+            "user_id": normalized_user_id,
+            "stream_id": str(open_session_result.get("session_id") or open_session_result.get("stream_id") or ""),
+            "session": open_session_result.get("stream") or {},
+            "message_id": message_id,
+            "expires_at": expires_at,
+            "bypass_seconds": PRIVATE_CHAT_TOOL_BYPASS_SECONDS,
+        }
+
+    @Tool(
+        "get_qq_by_msg_id",
+        description=(
+            "根据当前聊天中的消息 ID 获取该消息发送者的 QQ 用户 ID。"
+            "当只知道昵称或需要调用 open_private_chat 但缺少 user_id 时，先调用此工具。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="msg_id",
+                param_type=ToolParamType.STRING,
+                description="目标用户发送的消息 ID。",
+                required=True,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_get_qq_by_msg_id(
+        self,
+        msg_id: str = "",
+        stream_id: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """根据消息 ID 查询该消息发送者的 QQ 号。"""
+
+        del kwargs
+
+        normalized_msg_id = str(msg_id or "").strip()
+        if not normalized_msg_id:
+            return {"success": False, "error": "缺少目标消息 ID"}
+
+        target_stream_id = str(stream_id or chat_id or "").strip()
+        query_result = await self.ctx.message.get_by_id(
+            normalized_msg_id,
+            stream_id=target_stream_id,
+            include_binary_data=False,
+        )
+        if not isinstance(query_result, Mapping):
+            return {
+                "success": False,
+                "error": f"未找到消息: {normalized_msg_id}",
+                "msg_id": normalized_msg_id,
+            }
+
+        user_info = self._extract_message_user_info(query_result)
+        user_id = str(user_info.get("user_id") or "").strip()
+        if not user_id:
+            return {
+                "success": False,
+                "error": f"消息 {normalized_msg_id} 缺少发送者 QQ 号",
+                "msg_id": normalized_msg_id,
+            }
+
+        user_nickname = str(user_info.get("user_nickname") or "").strip()
+        user_cardname = str(user_info.get("user_cardname") or "").strip()
+        display_name = user_cardname or user_nickname or user_id
+        message_info = query_result.get("message_info", {})
+        if not isinstance(message_info, Mapping):
+            message_info = {}
+        group_info = message_info.get("group_info", {})
+        if not isinstance(group_info, Mapping):
+            group_info = {}
+
+        return {
+            "success": True,
+            "content": f"消息 {normalized_msg_id} 的发送者是 {display_name}，QQ 号为 {user_id}。",
+            "msg_id": normalized_msg_id,
+            "user_id": user_id,
+            "qq": user_id,
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+            "display_name": display_name,
+            "platform": str(query_result.get("platform") or "").strip(),
+            "session_id": str(query_result.get("session_id") or target_stream_id or "").strip(),
+            "group_id": str(group_info.get("group_id") or "").strip(),
+            "group_name": str(group_info.get("group_name") or "").strip(),
+        }
 
     @MessageGateway(
         name=SNOWLUMA_GATEWAY_NAME,
@@ -561,6 +768,25 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         """返回当前强类型配置。"""
 
         return self.config  # type: ignore[return-value]
+
+    async def _sync_private_chat_tool_component_state(self) -> None:
+        """按配置同步主动私聊工具组件的启停状态。"""
+
+        enabled = bool(self._load_settings().plugin.enable_private_chat_tool)
+        tool_names = ("open_private_chat", "get_qq_by_msg_id")
+        try:
+            for tool_name in tool_names:
+                if enabled:
+                    result = await self.ctx.component.enable_component(tool_name, "TOOL")
+                else:
+                    result = await self.ctx.component.disable_component(tool_name, "TOOL")
+                if isinstance(result, Mapping) and not bool(result.get("success", False)):
+                    self.ctx.logger.warning(
+                        f"SnowLuma 同步主动私聊工具启停状态失败: tool={tool_name} "
+                        f"error={result.get('error') or result}"
+                    )
+        except Exception as exc:
+            self.ctx.logger.warning(f"SnowLuma 同步主动私聊工具启停状态失败: {exc}")
 
     async def _restart_connection_if_needed(self) -> None:
         """根据当前配置重启连接循环。"""
@@ -744,6 +970,69 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             self._response_pool.pop(echo, None)
 
     @staticmethod
+    def _extract_action_error(response: Mapping[str, Any]) -> str:
+        """从 SnowLuma 动作响应中提取错误信息；空字符串表示成功。"""
+
+        status = str(response.get("status") or "").strip().lower()
+        retcode = response.get("retcode")
+        if status and status != "ok":
+            return str(response.get("wording") or response.get("message") or "SnowLuma send failed")
+        if isinstance(retcode, int) and retcode not in {0, 1}:
+            return str(response.get("wording") or response.get("message") or "SnowLuma send failed")
+        return ""
+
+    @staticmethod
+    def _extract_action_message_id(response: Mapping[str, Any]) -> str:
+        """从 SnowLuma 动作响应中提取平台消息 ID。"""
+
+        response_data = response.get("data", {})
+        if not isinstance(response_data, Mapping):
+            return ""
+        return str(response_data.get("message_id") or "").strip()
+
+    @staticmethod
+    def _extract_message_user_info(message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """从序列化消息中提取发送者信息。"""
+
+        message_info = message.get("message_info", {})
+        if not isinstance(message_info, Mapping):
+            return {}
+        user_info = message_info.get("user_info", {})
+        if not isinstance(user_info, Mapping):
+            return {}
+        return user_info
+
+    def _grant_private_chat_bypass(self, user_id: str) -> float:
+        """授予指定用户临时私聊名单放行窗口。"""
+
+        self._purge_expired_private_chat_bypasses()
+        expires_at = time.time() + PRIVATE_CHAT_TOOL_BYPASS_SECONDS
+        self._private_chat_bypass_expires_at[user_id] = expires_at
+        return expires_at
+
+    def _get_private_chat_bypass_remaining_seconds(self, user_id: str) -> float:
+        """获取指定用户临时私聊放行窗口的剩余秒数。"""
+
+        self._purge_expired_private_chat_bypasses()
+        expires_at = self._private_chat_bypass_expires_at.get(user_id, 0.0)
+        return max(0.0, expires_at - time.time())
+
+    def _has_active_private_chat_bypass(self, user_id: str) -> bool:
+        """判断指定用户是否处于临时私聊名单放行窗口内。"""
+
+        return self._get_private_chat_bypass_remaining_seconds(user_id) > 0
+
+    def _purge_expired_private_chat_bypasses(self) -> None:
+        """清理已过期的临时私聊名单放行记录。"""
+
+        now = time.time()
+        expired_user_ids = [
+            user_id for user_id, expires_at in self._private_chat_bypass_expires_at.items() if expires_at <= now
+        ]
+        for user_id in expired_user_ids:
+            self._private_chat_bypass_expires_at.pop(user_id, None)
+
+    @staticmethod
     def _normalize_positive_id(value: Any, field_name: str) -> int:
         """规范化 QQ 号、群号等正整数标识。"""
 
@@ -854,6 +1143,14 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if settings.chat.ban_qq_bot and self._is_official_qq_bot_payload(payload, sender):
             self.ctx.logger.debug(f"SnowLuma 官方机器人消息已丢弃: user_id={sender_user_id}")
             return False
+
+        if not group_id and self._has_active_private_chat_bypass(sender_user_id):
+            remaining_seconds = self._get_private_chat_bypass_remaining_seconds(sender_user_id)
+            self.ctx.logger.debug(
+                f"SnowLuma 私聊用户 {sender_user_id} 命中主动私聊临时放行，"
+                f"剩余 {remaining_seconds:.0f} 秒"
+            )
+            return True
 
         if not settings.chat.enable_chat_list_filter:
             return True

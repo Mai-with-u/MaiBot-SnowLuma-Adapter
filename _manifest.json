@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "SnowLuma 适配器/ SnowLuma Adapter",
   "description": "适用于SnowLuma的Maibot适配器/（开发版）/SnowLuma WebSocket adapter plugin for MaiBot message gateway.",
   "author": {
@@ -23,7 +23,12 @@
     "max_version": "2.99.99"
   },
   "dependencies": [],
-  "capabilities": [],
+  "capabilities": [
+    "chat.open_session",
+    "component.disable",
+    "component.enable",
+    "message.get_by_id"
+  ],
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [
