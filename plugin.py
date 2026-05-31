@@ -507,6 +507,16 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             },
         )
 
+    @API("adapter.napcat.account.get_cookies", description="获取 Cookies", version="1", public=True)
+    async def api_get_cookies(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """获取 Cookies。"""
+
+        normalized_params: Dict[str, Any] = dict(params) if isinstance(params, Mapping) else {}
+        return await self._call_action("get_cookies", normalized_params)
+
     @Tool(
         "open_private_chat",
         description=(
@@ -2180,24 +2190,49 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     segments.append(voice_segment)
                 continue
 
+            if item_type == "video":
+                video_segment = self._build_media_segment("video", item)
+                if video_segment:
+                    segments.append(video_segment)
+                continue
+
+            if item_type == "videourl":
+                video_segment = self._build_url_media_segment("video", item_data)
+                if video_segment:
+                    segments.append(video_segment)
+                continue
+
+            if item_type == "dict" and isinstance(item_data, Mapping):
+                dict_segment = self._build_dict_component_segment(item_data)
+                if dict_segment:
+                    segments.append(dict_segment)
+                    continue
+
             segments.append({"type": "text", "data": {"text": f"[unsupported:{item_type or 'unknown'}]"}})
 
         if not segments:
             segments.append({"type": "text", "data": {"text": ""}})
         return segments
 
-    @staticmethod
-    def _build_media_segment(segment_type: str, item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    @classmethod
+    def _build_media_segment(cls, segment_type: str, item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """构造 OneBot 媒体消息段。"""
 
         binary_base64 = str(item.get("binary_data_base64") or "").strip()
         if binary_base64:
             return {"type": segment_type, "data": {"file": f"base64://{binary_base64}"}}
 
-        item_data = item.get("data")
+        return cls._build_url_media_segment(segment_type, item.get("data"))
+
+    @staticmethod
+    def _build_url_media_segment(segment_type: str, item_data: Any) -> Optional[Dict[str, Any]]:
+        """构造 OneBot 媒体引用消息段。"""
+
         file_reference = ""
         if isinstance(item_data, Mapping):
-            file_reference = str(item_data.get("file") or item_data.get("url") or "").strip()
+            file_reference = str(
+                item_data.get("file") or item_data.get("url") or item_data.get("path") or item_data.get("media") or ""
+            ).strip()
         else:
             file_reference = str(item_data or "").strip()
 
@@ -2207,6 +2242,22 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not file_reference.startswith(("base64://", "file://", "http://", "https://")):
             file_reference = f"file://{file_reference}"
         return {"type": segment_type, "data": {"file": file_reference}}
+
+    @classmethod
+    def _build_dict_component_segment(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """构造 ``DictComponent`` 消息段。"""
+
+        raw_type = str(item_data.get("type") or "").strip()
+        raw_payload = item_data.get("data", item_data)
+        if raw_type == "video":
+            if isinstance(raw_payload, Mapping):
+                binary_base64 = str(raw_payload.get("binary_data_base64") or "").strip()
+                if binary_base64:
+                    return {"type": "video", "data": {"file": f"base64://{binary_base64}"}}
+            return cls._build_url_media_segment("video", raw_payload)
+        if raw_type == "videourl":
+            return cls._build_url_media_segment("video", raw_payload)
+        return None
 
     @staticmethod
     def _normalize_outbound_reply_id(message_id: str) -> Optional[str]:
