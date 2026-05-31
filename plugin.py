@@ -2178,10 +2178,20 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     self.ctx.logger.debug(f"SnowLuma 跳过无效回复目标消息 ID: {target_message_id}")
                 continue
 
-            if item_type in {"image", "emoji"}:
+            if item_type == "image":
                 image_segment = self._build_media_segment("image", item)
                 if image_segment:
                     segments.append(image_segment)
+                continue
+
+            if item_type == "emoji":
+                emoji_segment = self._build_media_segment("image", item)
+                if emoji_segment:
+                    data = emoji_segment.setdefault("data", {})
+                    if isinstance(data, dict):
+                        data["subType"] = 1
+                        data.setdefault("summary", "[动画表情]")
+                    segments.append(emoji_segment)
                 continue
 
             if item_type == "voice":
