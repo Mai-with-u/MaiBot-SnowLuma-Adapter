@@ -21,6 +21,7 @@ SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
 SUPPORTED_CONFIG_VERSION = "1.0.2"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
+OutboundAction = Tuple[str, Dict[str, Any]]
 
 
 def _schema_i18n(
@@ -517,6 +518,20 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         normalized_params: Dict[str, Any] = dict(params) if isinstance(params, Mapping) else {}
         return await self._call_action("get_cookies", normalized_params)
 
+    @API("adapter.napcat.file.upload_group_file", description="上传群文件", version="1", public=True)
+    async def api_upload_group_file(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """上传群文件。"""
+
+        normalized_params: Dict[str, Any] = dict(params) if isinstance(params, Mapping) else {}
+        return await self._call_action("upload_group_file", normalized_params)
+
+    @API("adapter.napcat.file.upload_private_file", description="上传私聊文件", version="1", public=True)
+    async def api_upload_private_file(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """上传私聊文件。"""
+
+        normalized_params: Dict[str, Any] = dict(params) if isinstance(params, Mapping) else {}
+        return await self._call_action("upload_private_file", normalized_params)
+
     @Tool(
         "open_private_chat",
         description=(
@@ -720,35 +735,30 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if self._ws is None:
             return {"success": False, "error": "SnowLuma WebSocket 尚未连接"}
 
+        action_results: List[Tuple[str, Dict[str, Any]]] = []
         try:
-            action_name, params = self._build_outbound_action(message, route or {})
-            response = await self._call_action(action_name, params)
+            for action_name, params in self._build_outbound_actions(message, route or {}):
+                response = await self._call_action(action_name, params)
+                if not isinstance(response, Mapping):
+                    return {"success": False, "error": "SnowLuma 返回了无效响应"}
+
+                action_error = self._extract_action_error(response)
+                if action_error:
+                    return {
+                        "success": False,
+                        "error": action_error,
+                        "metadata": {"action": action_name, "retcode": response.get("retcode")},
+                    }
+                action_results.append((action_name, response))
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-        if not isinstance(response, Mapping):
-            return {"success": False, "error": "SnowLuma 返回了无效响应"}
-
-        status = str(response.get("status") or "").lower()
-        retcode = response.get("retcode")
-        if status and status != "ok":
-            return {
-                "success": False,
-                "error": str(response.get("wording") or response.get("message") or "SnowLuma send failed"),
-                "metadata": {"retcode": retcode},
-            }
-        if isinstance(retcode, int) and retcode not in {0, 1}:
-            return {
-                "success": False,
-                "error": str(response.get("wording") or response.get("message") or "SnowLuma send failed"),
-                "metadata": {"retcode": retcode},
-            }
-
-        response_data = response.get("data", {})
         internal_message_id = str(message.get("message_id") or "").strip()
         external_message_id = ""
-        if isinstance(response_data, Mapping):
-            external_message_id = str(response_data.get("message_id") or "")
+        for _, response in action_results:
+            message_id = self._extract_action_message_id(response)
+            if message_id:
+                external_message_id = message_id
 
         adapter_callbacks = []
         if internal_message_id and external_message_id and internal_message_id != external_message_id:
@@ -765,11 +775,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 }
             )
 
+        action_names = [action_name for action_name, _ in action_results]
         return {
             "success": True,
             "external_message_id": external_message_id or None,
             "metadata": {
-                "action": action_name,
+                "action": action_names[-1] if action_names else "",
+                "actions": action_names,
                 "adapter_callbacks": adapter_callbacks,
             },
         }
@@ -2104,8 +2116,17 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self,
         message: Mapping[str, Any],
         route: Mapping[str, Any],
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> OutboundAction:
         """将 Host 出站消息转换为 SnowLuma 动作。"""
+
+        return self._build_outbound_actions(message, route)[0]
+
+    def _build_outbound_actions(
+        self,
+        message: Mapping[str, Any],
+        route: Mapping[str, Any],
+    ) -> List[OutboundAction]:
+        """将 Host 出站消息转换为 SnowLuma 动作序列。"""
 
         message_info = message.get("message_info", {})
         if not isinstance(message_info, Mapping):
@@ -2119,7 +2140,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not isinstance(additional_config, Mapping):
             additional_config = {}
 
-        segments = self._convert_outbound_segments(message.get("raw_message", []))
+        outbound_items = self._convert_outbound_items(message.get("raw_message", []))
         target_group_id = str(
             group_info.get("group_id")
             or additional_config.get("platform_io_target_group_id")
@@ -2128,7 +2149,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             or ""
         ).strip()
         if target_group_id:
-            return "send_msg", {"message_type": "group", "group_id": target_group_id, "message": segments}
+            return self._build_targeted_outbound_actions(
+                outbound_items,
+                message_type="group",
+                target_field="group_id",
+                target_id=target_group_id,
+                file_action="upload_group_file",
+            )
 
         target_user_id = str(
             additional_config.get("platform_io_target_user_id")
@@ -2140,15 +2167,88 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not target_user_id:
             raise ValueError("出站私聊消息缺少 target_user_id")
 
-        return "send_msg", {"message_type": "private", "user_id": target_user_id, "message": segments}
+        return self._build_targeted_outbound_actions(
+            outbound_items,
+            message_type="private",
+            target_field="user_id",
+            target_id=target_user_id,
+            file_action="upload_private_file",
+        )
+
+    @staticmethod
+    def _build_targeted_outbound_actions(
+        outbound_items: List[Dict[str, Any]],
+        *,
+        message_type: str,
+        target_field: str,
+        target_id: str,
+        file_action: str,
+    ) -> List[OutboundAction]:
+        """按目标把普通消息段和文件上传动作拆成有序动作。"""
+
+        actions: List[OutboundAction] = []
+        pending_segments: List[Dict[str, Any]] = []
+
+        def flush_segments() -> None:
+            if not pending_segments:
+                return
+            actions.append(
+                (
+                    "send_msg",
+                    {
+                        "message_type": message_type,
+                        target_field: target_id,
+                        "message": list(pending_segments),
+                    },
+                )
+            )
+            pending_segments.clear()
+
+        for outbound_item in outbound_items:
+            item_kind = str(outbound_item.get("kind") or "").strip()
+            item_payload = outbound_item.get("payload")
+            if item_kind == "file" and isinstance(item_payload, Mapping):
+                flush_segments()
+                upload_params = dict(item_payload)
+                upload_params[target_field] = target_id
+                actions.append((file_action, upload_params))
+                continue
+            if item_kind == "segment" and isinstance(item_payload, Mapping):
+                pending_segments.append(dict(item_payload))
+
+        flush_segments()
+        if not actions:
+            actions.append(
+                (
+                    "send_msg",
+                    {
+                        "message_type": message_type,
+                        target_field: target_id,
+                        "message": [{"type": "text", "data": {"text": ""}}],
+                    },
+                )
+            )
+        return actions
 
     def _convert_outbound_segments(self, raw_message: Any) -> List[Dict[str, Any]]:
         """将 Host 消息段转换为 OneBot 消息段。"""
 
-        if not isinstance(raw_message, list):
-            return [{"type": "text", "data": {"text": ""}}]
+        segments = [
+            dict(item["payload"])
+            for item in self._convert_outbound_items(raw_message)
+            if item.get("kind") == "segment" and isinstance(item.get("payload"), Mapping)
+        ]
+        if not segments:
+            segments.append({"type": "text", "data": {"text": ""}})
+        return segments
 
-        segments: List[Dict[str, Any]] = []
+    def _convert_outbound_items(self, raw_message: Any) -> List[Dict[str, Any]]:
+        """将 Host 消息段转换为可发送的普通段或文件上传项。"""
+
+        if not isinstance(raw_message, list):
+            return []
+
+        outbound_items: List[Dict[str, Any]] = []
         for item in raw_message:
             if not isinstance(item, Mapping):
                 continue
@@ -2156,13 +2256,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             item_type = str(item.get("type") or "").strip()
             item_data = item.get("data")
             if item_type == "text":
-                segments.append({"type": "text", "data": {"text": str(item_data or "")}})
+                outbound_items.append(
+                    {"kind": "segment", "payload": {"type": "text", "data": {"text": str(item_data or "")}}}
+                )
                 continue
 
             if item_type == "at" and isinstance(item_data, Mapping):
                 target_user_id = str(item_data.get("target_user_id") or "").strip()
                 if target_user_id:
-                    segments.append({"type": "at", "data": {"qq": target_user_id}})
+                    outbound_items.append({"kind": "segment", "payload": {"type": "at", "data": {"qq": target_user_id}}})
                 continue
 
             if item_type == "reply":
@@ -2173,7 +2275,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     target_message_id = str(item_data or "").strip()
                 normalized_reply_id = self._normalize_outbound_reply_id(target_message_id)
                 if normalized_reply_id is not None:
-                    segments.append({"type": "reply", "data": {"id": normalized_reply_id}})
+                    outbound_items.append(
+                        {"kind": "segment", "payload": {"type": "reply", "data": {"id": normalized_reply_id}}}
+                    )
                 elif target_message_id:
                     self.ctx.logger.debug(f"SnowLuma 跳过无效回复目标消息 ID: {target_message_id}")
                 continue
@@ -2181,7 +2285,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             if item_type == "image":
                 image_segment = self._build_media_segment("image", item)
                 if image_segment:
-                    segments.append(image_segment)
+                    outbound_items.append({"kind": "segment", "payload": image_segment})
                 continue
 
             if item_type == "emoji":
@@ -2191,38 +2295,55 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     if isinstance(data, dict):
                         data["subType"] = 1
                         data.setdefault("summary", "[动画表情]")
-                    segments.append(emoji_segment)
+                    outbound_items.append({"kind": "segment", "payload": emoji_segment})
                 continue
 
             if item_type == "voice":
                 voice_segment = self._build_media_segment("record", item)
                 if voice_segment:
-                    segments.append(voice_segment)
+                    outbound_items.append({"kind": "segment", "payload": voice_segment})
                 continue
 
             if item_type == "video":
                 video_segment = self._build_media_segment("video", item)
                 if video_segment:
-                    segments.append(video_segment)
+                    outbound_items.append({"kind": "segment", "payload": video_segment})
                 continue
 
             if item_type == "videourl":
                 video_segment = self._build_url_media_segment("video", item_data)
                 if video_segment:
-                    segments.append(video_segment)
+                    outbound_items.append({"kind": "segment", "payload": video_segment})
+                continue
+
+            if item_type == "file":
+                file_payload = self._build_file_upload_payload(item_data)
+                if not file_payload:
+                    binary_base64 = str(item.get("binary_data_base64") or "").strip()
+                    if binary_base64:
+                        file_payload = {"file": f"base64://{binary_base64}"}
+                if file_payload:
+                    outbound_items.append({"kind": "file", "payload": file_payload})
                 continue
 
             if item_type == "dict" and isinstance(item_data, Mapping):
+                file_payload = self._build_dict_component_file_upload_payload(item_data)
+                if file_payload:
+                    outbound_items.append({"kind": "file", "payload": file_payload})
+                    continue
                 dict_segment = self._build_dict_component_segment(item_data)
                 if dict_segment:
-                    segments.append(dict_segment)
+                    outbound_items.append({"kind": "segment", "payload": dict_segment})
                     continue
 
-            segments.append({"type": "text", "data": {"text": f"[unsupported:{item_type or 'unknown'}]"}})
+            outbound_items.append(
+                {
+                    "kind": "segment",
+                    "payload": {"type": "text", "data": {"text": f"[unsupported:{item_type or 'unknown'}]"}},
+                }
+            )
 
-        if not segments:
-            segments.append({"type": "text", "data": {"text": ""}})
-        return segments
+        return outbound_items
 
     @classmethod
     def _build_media_segment(cls, segment_type: str, item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2252,6 +2373,48 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not file_reference.startswith(("base64://", "file://", "http://", "https://")):
             file_reference = f"file://{file_reference}"
         return {"type": segment_type, "data": {"file": file_reference}}
+
+    @staticmethod
+    def _build_file_upload_payload(item_data: Any) -> Optional[Dict[str, Any]]:
+        """构造 SnowLuma 文件上传动作参数。"""
+
+        if isinstance(item_data, str):
+            file_reference = item_data.strip()
+            if not file_reference:
+                return None
+            return {"file": file_reference}
+
+        if not isinstance(item_data, Mapping):
+            return None
+
+        file_reference = str(item_data.get("file") or item_data.get("path") or item_data.get("url") or "").strip()
+        if not file_reference:
+            return None
+
+        payload: Dict[str, Any] = {"file": file_reference}
+        file_name = str(
+            item_data.get("name") or item_data.get("filename") or item_data.get("file_name") or ""
+        ).strip()
+        if file_name:
+            payload["name"] = file_name
+
+        folder_id = str(item_data.get("folder") or item_data.get("folder_id") or "").strip()
+        if folder_id:
+            payload["folder"] = folder_id
+
+        upload_file = item_data.get("upload_file")
+        if isinstance(upload_file, bool):
+            payload["upload_file"] = upload_file
+        return payload
+
+    @classmethod
+    def _build_dict_component_file_upload_payload(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """从 ``DictComponent`` 提取文件上传动作参数。"""
+
+        raw_type = str(item_data.get("type") or "").strip()
+        if raw_type != "file":
+            return None
+        return cls._build_file_upload_payload(item_data.get("data", item_data))
 
     @classmethod
     def _build_dict_component_segment(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
