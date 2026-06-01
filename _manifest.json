@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.5.0",
-  "name": "SnowLuma 适配器/ SnowLuma Adapter",
-  "description": "适用于SnowLuma的Maibot适配器/（开发版）/SnowLuma WebSocket adapter plugin for MaiBot message gateway.",
+  "version": "0.5.1",
+  "name": "SnowLuma 连接器（适配器）/ SnowLuma Adapter",
+  "description": "连接SnowLuma的Maibot连接器/SnowLuma WebSocket adapter plugin for MaiBot message gateway.",
   "author": {
     "name": "MaiBot Team",
     "url": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
@@ -13,6 +13,13 @@
     "homepage": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter",
     "documentation": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter",
     "issues": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter/issues"
+  },
+  "plugin_type":"adapter",
+  "display": {
+    "icon":{
+      "type": "local",
+      "value": "assets/icon.jpg"
+    }
   },
   "host_application": {
     "min_version": "1.0.0",
