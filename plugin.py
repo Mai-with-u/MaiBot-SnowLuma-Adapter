@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from importlib import import_module
+from io import BytesIO
 from pathlib import Path
+from shutil import which
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -16,11 +19,18 @@ import hashlib
 import json
 import time
 
+try:
+    from .qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
+except ImportError:
+    from qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
+
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.2"
+SUPPORTED_CONFIG_VERSION = "1.0.3"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
+VOICE_TRANSCODE_SAMPLE_RATE = 24000
+VOICE_TRANSCODE_TIMEOUT_SECONDS = 15.0
 
 
 def _schema_i18n(
@@ -104,6 +114,27 @@ class SnowLumaPluginSection(PluginConfigBase):
                 ),
             ),
             "order": 2,
+        },
+    )
+    qq_face_parse_mode: Literal["description", "emoji"] = Field(
+        default="description",
+        description="QQ 自带表情解析模式：转为中文描述或近似 Unicode emoji。",
+        json_schema_extra={
+            "label": "QQ 自带表情解析",
+            "hint": "description 会把 [CQ:face,id=5] 转成 [流泪]；emoji 会优先转成近似 Unicode 表情。",
+            "i18n": _schema_i18n(
+                label_en="QQ face parsing",
+                label_ja="QQ 標準顔文字の解析",
+                hint_en=(
+                    "description converts [CQ:face,id=5] to [流泪]; "
+                    "emoji prefers an approximate Unicode emoji."
+                ),
+                hint_ja=(
+                    "description は [CQ:face,id=5] を [流泪] に変換します。"
+                    "emoji は近い Unicode 絵文字を優先します。"
+                ),
+            ),
+            "order": 3,
         },
     )
     config_version: str = Field(
@@ -447,7 +478,6 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self._connected_account_id: str = ""
         self._group_name_cache: Dict[str, str] = {}
         self._group_member_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
-        self._user_name_cache: Dict[str, Dict[str, str]] = {}
         self._private_chat_bypass_expires_at: Dict[str, float] = {}
 
     async def on_load(self) -> None:
@@ -1221,8 +1251,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not user_id:
             raise ValueError("缺少 user_id")
 
-        message_type = str(payload.get("message_type") or "").strip() or "private"
+        message_type = str(payload.get("message_type") or "").strip()
+        if message_type not in {"private", "group"}:
+            raise ValueError(f"不支持或缺少 message_type: {message_type or '<empty>'}")
         group_id = str(payload.get("group_id") or "").strip()
+        if message_type == "group" and not group_id:
+            raise ValueError("群消息缺少 group_id")
         user_nickname = str(sender.get("nickname") or sender.get("card") or user_id).strip() or user_id
         user_cardname = str(sender.get("card") or "").strip() or None
 
@@ -1236,8 +1270,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(inbound_raw_message)
         if not raw_message:
-            raw_message = [{"type": "text", "data": "[unsupported]"}]
-            plain_text = "[unsupported]"
+            raise ValueError("消息内容为空或没有可转换的消息段")
 
         timestamp_seconds = payload.get("time")
         if not isinstance(timestamp_seconds, (int, float)) or timestamp_seconds <= 0:
@@ -1247,7 +1280,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             "self_id": self._connected_account_id,
             "snowluma_message_type": message_type,
         }
-        if group_id:
+        if message_type == "group":
             additional_config["platform_io_target_group_id"] = group_id
         else:
             additional_config["platform_io_target_user_id"] = user_id
@@ -1260,11 +1293,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             },
             "additional_config": additional_config,
         }
-        if group_id:
+        if message_type == "group":
             group_name = await self._resolve_group_name(payload, group_id)
             message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
 
-        message_id = str(payload.get("message_id") or f"snowluma-{uuid4().hex}").strip()
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            raise ValueError("缺少 message_id")
         message_dict: Dict[str, Any] = {
             "message_id": message_id,
             "timestamp": str(float(timestamp_seconds)),
@@ -1297,23 +1332,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if cached_group_name:
             return cached_group_name
 
-        for action_name in ("get_group_info", "get_group_info_ex"):
-            try:
-                response = await self._call_action(action_name, {"group_id": group_id})
-            except Exception as exc:
-                self.ctx.logger.debug(f"SnowLuma 查询群名称失败: action={action_name} group_id={group_id} error={exc}")
-                continue
+        try:
+            response = await self._call_action("get_group_info", {"group_id": group_id})
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 查询群名称失败: group_id={group_id} error={exc}")
+            return f"group_{group_id}"
 
-            group_info = response.get("data", response)
-            if not isinstance(group_info, Mapping):
-                continue
-
-            resolved_group_name = str(
-                group_info.get("group_name")
-                or group_info.get("group_remark")
-                or group_info.get("name")
-                or ""
-            ).strip()
+        group_info = response.get("data", response)
+        if isinstance(group_info, Mapping):
+            resolved_group_name = str(group_info.get("group_name") or "").strip()
             if resolved_group_name:
                 self._group_name_cache[group_id] = resolved_group_name
                 return resolved_group_name
@@ -1359,50 +1386,10 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         member_info = response.get("data", response)
         if not isinstance(member_info, Mapping):
             self._group_member_cache[cache_key] = {}
-            return await self._resolve_user_names(normalized_user_id)
+            return {}
 
         resolved_names = self._extract_member_name_fields(member_info)
-        if not resolved_names:
-            resolved_names = await self._resolve_user_names(normalized_user_id)
-
         self._group_member_cache[cache_key] = resolved_names
-        return resolved_names
-
-    async def _resolve_user_names(self, user_id: str) -> Dict[str, str]:
-        """通过 SnowLuma 查询用户基础昵称，作为群成员信息缺失时的补充。"""
-
-        normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id:
-            return {}
-        if normalized_user_id in self._user_name_cache:
-            return self._user_name_cache[normalized_user_id]
-
-        try:
-            response = await self._call_action(
-                "get_stranger_info",
-                {
-                    "user_id": self._normalize_positive_id(normalized_user_id, "user_id"),
-                    "no_cache": True,
-                },
-            )
-        except Exception as exc:
-            self.ctx.logger.debug(f"SnowLuma 查询转发节点用户昵称失败: user_id={normalized_user_id} error={exc}")
-            self._user_name_cache[normalized_user_id] = {}
-            return {}
-
-        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
-            self.ctx.logger.info(
-                "SnowLuma 转发节点用户信息响应: "
-                f"user_id={normalized_user_id!r} response={json.dumps(response, ensure_ascii=False, default=str)}"
-            )
-
-        user_info = response.get("data", response)
-        if not isinstance(user_info, Mapping):
-            self._user_name_cache[normalized_user_id] = {}
-            return {}
-
-        resolved_names = self._extract_member_name_fields(user_info)
-        self._user_name_cache[normalized_user_id] = resolved_names
         return resolved_names
 
     @staticmethod
@@ -1410,19 +1397,8 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         """从 SnowLuma/NapCat 用户信息字段中提取名片和昵称。"""
 
         resolved_names: Dict[str, str] = {}
-        cardname = str(
-            member_info.get("card")
-            or member_info.get("card_name")
-            or member_info.get("group_card")
-            or member_info.get("remark")
-            or ""
-        ).strip()
-        nickname = str(
-            member_info.get("nickname")
-            or member_info.get("nick")
-            or member_info.get("name")
-            or ""
-        ).strip()
+        cardname = str(member_info.get("card") or "").strip()
+        nickname = str(member_info.get("nickname") or "").strip()
         if cardname:
             resolved_names["card"] = cardname
         if nickname:
@@ -1524,8 +1500,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 continue
 
             if item_type in {"face", "emoji"}:
-                face_id = str(item_data.get("id") or "").strip()
-                text = f"[face:{face_id}]" if face_id else "[face]"
+                text = self._build_inbound_face_text(item_data)
                 segments.append({"type": "text", "data": text})
                 plain_text_parts.append(text)
                 continue
@@ -1536,11 +1511,29 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 plain_text_parts.append(self._build_forward_plain_text(forward_segment))
                 continue
 
-            fallback_text = f"[{item_type or 'unknown'}]"
-            segments.append({"type": "text", "data": fallback_text})
-            plain_text_parts.append(fallback_text)
+            unknown_type = item_type or "unknown"
+            segments.append({"type": "dict", "data": {"type": unknown_type, "data": dict(item_data)}})
+            plain_text_parts.append(f"[{unknown_type}]")
 
         return segments, "".join(plain_text_parts), is_at, is_picture
+
+    def _build_inbound_face_text(self, segment_data: Mapping[str, Any]) -> str:
+        """把 QQ 自带表情 face 段转成可读文本或近似 Unicode emoji。"""
+
+        face_id = str(segment_data.get("id") or "").strip()
+        if not face_id:
+            return "[QQ表情]"
+
+        settings = self._load_settings()
+        if settings.plugin.qq_face_parse_mode == "emoji":
+            emoji_text = QQ_FACE_EMOJIS.get(face_id)
+            if emoji_text:
+                return emoji_text
+
+        description = QQ_FACE_DESCRIPTIONS.get(face_id)
+        if description:
+            return f"[{description}]"
+        return f"[QQ表情:{face_id}]"
 
     @staticmethod
     def _build_inbound_file_text(segment_data: Mapping[str, Any]) -> str:
@@ -1763,7 +1756,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 return {"type": "text", "data": "[forward]"}
 
             try:
-                response = await self._call_action("get_forward_msg", {"message_id": forward_id, "id": forward_id})
+                response = await self._call_action("get_forward_msg", {"id": forward_id})
             except Exception as exc:
                 self.ctx.logger.debug(f"SnowLuma 获取合并转发详情失败: id={forward_id} error={exc}")
                 return {"type": "text", "data": "[forward]"}
@@ -1818,6 +1811,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
             raw_content = self._extract_forward_node_content(forward_message)
             content_segments, _, _, _ = await self._convert_inbound_segments(raw_content)
+            if not content_segments:
+                continue
+
             sender = self._extract_forward_node_sender(forward_message)
             node_data = forward_message.get("data", {})
             if not isinstance(node_data, Mapping):
@@ -1868,9 +1864,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                         or node_payload.get("message_id")
                         or node_payload.get("id")
                         or node_data.get("id")
-                        or uuid4().hex
+                        or ""
                     ),
-                    "content": content_segments or [{"type": "text", "data": "[empty]"}],
+                    "content": content_segments,
                 }
             )
         return forward_nodes
@@ -1948,12 +1944,25 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     ) -> Dict[str, Any]:
         """构造 Host 可识别的入站媒体段。"""
 
-        binary_data = await self._load_binary_reference(file_reference)
-        if not binary_data and segment_data is not None:
+        if segment_type == "voice" and segment_data is not None:
             binary_data = await self._load_binary_from_segment_data(segment_type, segment_data)
+            if not binary_data:
+                binary_data = await self._load_binary_reference(file_reference)
+        else:
+            binary_data = await self._load_binary_reference(file_reference)
+            if not binary_data and segment_data is not None:
+                binary_data = await self._load_binary_from_segment_data(segment_type, segment_data)
         if not binary_data:
             self.ctx.logger.debug(f"SnowLuma 媒体下载失败，降级为文本: type={segment_type} ref={file_reference[:120]}")
             return {"type": "text", "data": fallback_text}
+        if segment_type == "voice" and self._is_silk_voice_binary(binary_data):
+            transcoded_binary = await self._transcode_silk_voice_binary(binary_data)
+            if not transcoded_binary:
+                self.ctx.logger.warning(
+                    "SnowLuma 收到 Silk 语音数据，get_record 未返回通用音频，且本地 Silk 转码失败，已降级为文本占位"
+                )
+                return {"type": "text", "data": fallback_text}
+            binary_data = transcoded_binary
 
         return {
             "type": segment_type,
@@ -1999,7 +2008,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         return b""
 
     async def _load_binary_from_segment_data(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
-        """从媒体段的备用字段或 OneBot 动作中加载二进制内容。"""
+        """从媒体段的标准引用字段或 OneBot 动作中加载二进制内容。"""
+
+        if segment_type == "voice":
+            binary_data = await self._load_binary_from_onebot_action(segment_type, segment_data)
+            if binary_data:
+                return binary_data
 
         for field_name in ("base64", "data"):
             raw_value = segment_data.get(field_name)
@@ -2018,14 +2032,20 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             if binary_data:
                 return binary_data
 
-        file_name = str(segment_data.get("file") or segment_data.get("file_id") or segment_data.get("id") or "").strip()
+        return await self._load_binary_from_onebot_action(segment_type, segment_data)
+
+    async def _load_binary_from_onebot_action(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
+        """通过 OneBot 动作加载媒体，语音交给 get_record 转码路径。"""
+
+        if segment_type == "voice":
+            return await self._load_voice_binary_from_onebot_action(segment_data)
+
+        file_name = str(segment_data.get("file") or "").strip()
         if not file_name:
             return b""
 
-        action_name = "get_record" if segment_type == "voice" else "get_image"
+        action_name = "get_image"
         params: Dict[str, Any] = {"file": file_name}
-        if segment_type == "voice":
-            params["out_format"] = "mp3"
 
         try:
             response = await self._call_action(action_name, params)
@@ -2042,39 +2062,138 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 f"response={json.dumps(response, ensure_ascii=False, default=str)}"
             )
 
+        return await self._extract_binary_from_action_response(response)
+
+    async def _load_voice_binary_from_onebot_action(self, segment_data: Mapping[str, Any]) -> bytes:
+        """通过 get_record 获取已转码语音。"""
+
+        params = self._build_voice_record_action_params(segment_data)
+        if params is None:
+            return b""
+
+        try:
+            response = await self._call_action("get_record", params)
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 通过 get_record 加载语音失败: params={params} error={exc}")
+            return b""
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 语音动作响应: "
+                f"action='get_record' params={json.dumps(params, ensure_ascii=False, default=str)} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        binary_data = await self._extract_binary_from_action_response(response)
+        if binary_data:
+            if self._is_silk_voice_binary(binary_data):
+                response_data = response.get("data", {})
+                if not isinstance(response_data, Mapping):
+                    response_data = {}
+                returned_file = str(response_data.get("file") or "")[:120]
+                returned_file_name = str(response_data.get("file_name") or "")
+                self.ctx.logger.debug(
+                    "SnowLuma get_record 返回的媒体仍是 Silk 原始数据: "
+                    f"params={params} file_name={returned_file_name!r} file={returned_file!r}"
+                )
+            return binary_data
+        return b""
+
+    async def _extract_binary_from_action_response(self, response: Mapping[str, Any]) -> bytes:
+        """从 OneBot 动作响应中提取二进制媒体内容。"""
+
         response_data = response.get("data", response)
-        if isinstance(response_data, str):
-            binary_data = await self._load_binary_reference(response_data)
-            if binary_data:
-                return binary_data
-            normalized_value = response_data.strip()
-            if normalized_value.startswith("base64://"):
-                normalized_value = normalized_value.removeprefix("base64://")
-            try:
-                return base64.b64decode(normalized_value, validate=True)
-            except Exception:
-                return b""
         if not isinstance(response_data, Mapping):
             return b""
 
-        for field_name in ("base64", "data"):
-            raw_value = response_data.get(field_name)
-            if not isinstance(raw_value, str) or not raw_value.strip():
-                continue
-            normalized_value = raw_value.strip()
-            if normalized_value.startswith("base64://"):
-                normalized_value = normalized_value.removeprefix("base64://")
-            try:
-                return base64.b64decode(normalized_value, validate=True)
-            except Exception:
-                continue
+        return await self._load_binary_reference(str(response_data.get("file") or ""))
 
-        for field_name in ("url", "path", "file_path", "file"):
-            binary_data = await self._load_binary_reference(str(response_data.get(field_name) or ""))
-            if binary_data:
-                return binary_data
+    @staticmethod
+    def _build_voice_record_action_params(segment_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """构造 OneBot get_record 请求参数。"""
 
-        return b""
+        file_name = str(segment_data.get("file") or "").strip()
+        if not file_name:
+            return None
+        return {"file": file_name, "out_format": "mp3"}
+
+    @staticmethod
+    def _is_silk_voice_binary(binary_data: bytes) -> bool:
+        """判断语音数据是否仍是 QQ Silk，避免误作为通用音频送入 ASR。"""
+
+        return binary_data.startswith(b"#!SILK_V3") or binary_data.startswith(b"\x02#!SILK_V3")
+
+    async def _transcode_silk_voice_binary(self, silk_binary: bytes) -> bytes:
+        """把 QQ Silk 语音转成 ASR 更容易识别的 MP3。"""
+
+        pcm_binary = await asyncio.to_thread(self._decode_silk_to_pcm_sync, silk_binary)
+        if not pcm_binary:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 解码失败：请安装插件依赖 silk-python")
+            return b""
+
+        ffmpeg_path = which("ffmpeg")
+        if not ffmpeg_path:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 失败：未找到 ffmpeg 可执行文件")
+            return b""
+
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            str(VOICE_TRANSCODE_SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-f",
+            "mp3",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            mp3_binary, stderr_binary = await asyncio.wait_for(
+                process.communicate(pcm_binary),
+                timeout=VOICE_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 超时")
+            return b""
+
+        if process.returncode != 0:
+            stderr_text = stderr_binary.decode("utf-8", errors="ignore").strip()
+            self.ctx.logger.warning(f"SnowLuma 本地 Silk 转 MP3 失败: {stderr_text[:200]}")
+            return b""
+
+        if not mp3_binary:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 失败：ffmpeg 未输出音频数据")
+            return b""
+        return mp3_binary
+
+    @staticmethod
+    def _decode_silk_to_pcm_sync(silk_binary: bytes) -> bytes:
+        """用 silk-python 解码 QQ Silk，返回 s16le PCM。"""
+
+        try:
+            pysilk = import_module("pysilk")
+        except ImportError:
+            return b""
+
+        silk_buffer = BytesIO(silk_binary)
+        pcm_buffer = BytesIO()
+        try:
+            pysilk.decode(silk_buffer, pcm_buffer, VOICE_TRANSCODE_SAMPLE_RATE)
+        except Exception:
+            return b""
+        return pcm_buffer.getvalue()
 
     @staticmethod
     def _is_emoji_image_segment(segment_data: Mapping[str, Any]) -> bool:
@@ -2110,6 +2229,8 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             additional_config = {}
 
         segments = self._convert_outbound_segments(message.get("raw_message", []))
+        if not segments:
+            raise ValueError("出站消息没有可转换的 OneBot 消息段")
         target_group_id = str(
             group_info.get("group_id")
             or additional_config.get("platform_io_target_group_id")
@@ -2136,7 +2257,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         """将 Host 消息段转换为 OneBot 消息段。"""
 
         if not isinstance(raw_message, list):
-            return [{"type": "text", "data": {"text": ""}}]
+            return []
 
         segments: List[Dict[str, Any]] = []
         for item in raw_message:
@@ -2180,10 +2301,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     segments.append(voice_segment)
                 continue
 
-            segments.append({"type": "text", "data": {"text": f"[unsupported:{item_type or 'unknown'}]"}})
-
-        if not segments:
-            segments.append({"type": "text", "data": {"text": ""}})
+            self.ctx.logger.debug(f"SnowLuma 跳过无法转换的出站消息段: type={item_type or 'unknown'}")
         return segments
 
     @staticmethod
