@@ -619,11 +619,11 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
     @API("adapter.napcat.message.delete_msg", description="撤回消息", version="1", public=True)
     async def api_delete_msg(self, **kwargs: Any) -> Dict[str, Any]:
-        """撤回消息。"""
+        """撤回消息。message_id 允许为负（OneBot 32 位有符号回绕值）。"""
         params = kwargs.get("params", kwargs)
         return await self._call_action(
             "delete_msg",
-            {"message_id": self._normalize_positive_id(params.get("message_id"), "message_id")},
+            {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
         )
 
     @API("adapter.napcat.message.get_group_msg_history", description="获取群消息历史", version="1", public=True)
@@ -1204,6 +1204,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if normalized_value < 0:
             raise ValueError(f"{field_name} 必须是非负整数")
         return normalized_value
+
+    @staticmethod
+    def _normalize_int(value: Any, field_name: str) -> int:
+        """规范化任意整数（允许负数）。message_id 等可能是 32 位有符号回绕值。"""
+
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
 
     @staticmethod
     def _normalize_inbound_reply_id(value: Any) -> str:
