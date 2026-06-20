@@ -536,6 +536,125 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             },
         )
 
+    # ================================================================
+    # 发送 / 撤回 / 登录信息 公开 API
+    # 供 ai_draw_plugin 等插件通过 SDK passthrough 调用，避免插件直连 NapCat。
+    # 走 WebSocket 长连接（_call_action），回传 message_id 以支持精确撤回。
+    # ================================================================
+
+    def _action_result(self, response: Mapping[str, Any]) -> Dict[str, Any]:
+        """统一封装动作响应：附带 message_id，保留原始 data/retcode。"""
+
+        return {
+            "status": str(response.get("status") or ""),
+            "retcode": response.get("retcode"),
+            "message_id": self._extract_action_message_id(response),
+            "data": response.get("data"),
+        }
+
+    @API("adapter.napcat.message.send_group_msg", description="发送群消息", version="1", public=True)
+    async def api_send_group_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送群消息（OneBot message 段数组）。"""
+        params = kwargs.get("params", kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action(
+            "send_group_msg",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "message": message,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_private_msg", description="发送私聊消息", version="1", public=True)
+    async def api_send_private_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送私聊消息（OneBot message 段数组）。"""
+        params = kwargs.get("params", kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action(
+            "send_private_msg",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "message": message,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_group_forward_msg", description="发送群合并转发消息", version="1", public=True)
+    async def api_send_group_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送群合并转发消息（OneBot node 段数组）。"""
+        params = kwargs.get("params", kwargs)
+        messages = params.get("messages") or params.get("message")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages 必须是非空的转发节点数组")
+        response = await self._call_action(
+            "send_group_forward_msg",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "messages": messages,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_private_forward_msg", description="发送私聊合并转发消息", version="1", public=True)
+    async def api_send_private_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送私聊合并转发消息（OneBot node 段数组）。"""
+        params = kwargs.get("params", kwargs)
+        messages = params.get("messages") or params.get("message")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages 必须是非空的转发节点数组")
+        response = await self._call_action(
+            "send_private_forward_msg",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "messages": messages,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.delete_msg", description="撤回消息", version="1", public=True)
+    async def api_delete_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """撤回消息。message_id 允许为负（OneBot 32 位有符号回绕值）。"""
+        params = kwargs.get("params", kwargs)
+        return await self._call_action(
+            "delete_msg",
+            {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
+        )
+
+    @API("adapter.napcat.message.get_group_msg_history", description="获取群消息历史", version="1", public=True)
+    async def api_get_group_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群消息历史。"""
+        params = kwargs.get("params", kwargs)
+        return await self._call_action(
+            "get_group_msg_history",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "count": int(params.get("count", 20)),
+            },
+        )
+
+    @API("adapter.napcat.message.get_friend_msg_history", description="获取私聊消息历史", version="1", public=True)
+    async def api_get_friend_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取私聊消息历史。"""
+        params = kwargs.get("params", kwargs)
+        return await self._call_action(
+            "get_friend_msg_history",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "count": int(params.get("count", 20)),
+            },
+        )
+
+    @API("adapter.napcat.system.get_login_info", description="获取当前登录账号信息", version="1", public=True)
+    async def api_get_login_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 bot 自身 QQ 号与昵称（合并转发节点需要真实 uin）。"""
+        del kwargs
+        return await self._call_action("get_login_info", {})
+
     @Tool(
         "open_private_chat",
         description=(
@@ -1094,6 +1213,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if normalized_value < 0:
             raise ValueError(f"{field_name} 必须是非负整数")
         return normalized_value
+
+    @staticmethod
+    def _normalize_int(value: Any, field_name: str) -> int:
+        """规范化任意整数（允许负数）。message_id 等可能是 32 位有符号回绕值。"""
+
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
 
     @staticmethod
     def _normalize_inbound_reply_id(value: Any) -> str:
