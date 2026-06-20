@@ -70,7 +70,6 @@ class SnowLumaPluginSection(PluginConfigBase):
         description="是否启用 SnowLuma 适配器。",
         json_schema_extra={
             "label": "启用适配器",
-            "hint": "关闭时插件只注册消息网关，不会主动连接 SnowLuma。",
             "i18n": _schema_i18n(
                 label_en="Enable adapter",
                 label_ja="アダプターを有効化",
@@ -84,8 +83,8 @@ class SnowLumaPluginSection(PluginConfigBase):
         default=False,
         description="是否启用 Ada 调试模式，记录 SnowLuma 入站原始消息段。",
         json_schema_extra={
-            "label": "Ada 调试原始消息段",
-            "hint": "仅排查消息段结构问题时开启；开启后会以 info 级别记录每条入站消息的原始 message 字段。",
+            "label": "显示原始消息段",
+            "hint": "仅排查消息段结构问题时开启；开启后会记录每条入站消息的原始 message 字段。",
             "i18n": _schema_i18n(
                 label_en="Ada raw message debug",
                 label_ja="Ada 生メッセージデバッグ",
@@ -100,7 +99,7 @@ class SnowLumaPluginSection(PluginConfigBase):
         description="是否启用主动开启私聊工具。",
         json_schema_extra={
             "label": "启用主动私聊工具",
-            "hint": "开启后，模型可调用工具向指定用户发送首条私聊消息，并在 15 分钟内绕过私聊名单过滤。",
+            "hint": "开启后，模型可调用工具向指定 好友 发送首条私聊消息，并在 15 分钟内绕过私聊名单过滤。",
             "i18n": _schema_i18n(
                 label_en="Enable private chat tool",
                 label_ja="個人チャット開始ツールを有効化",
@@ -120,8 +119,8 @@ class SnowLumaPluginSection(PluginConfigBase):
         default="description",
         description="QQ 自带表情解析模式：转为中文描述或近似 Unicode emoji。",
         json_schema_extra={
-            "label": "QQ 自带表情解析",
-            "hint": "description 会把 [CQ:face,id=5] 转成 [流泪]；emoji 会优先转成近似 Unicode 表情。",
+            "label": "QQ表情解析模式",
+            "hint": "[description]模式会把表情转成[流泪]这种形式[emoji]会转成近似emoji表情。",
             "i18n": _schema_i18n(
                 label_en="QQ face parsing",
                 label_ja="QQ 標準顔文字の解析",
@@ -282,7 +281,7 @@ class SnowLumaChatSection(PluginConfigBase):
     )
     show_dropped_chat_list_messages: bool = Field(
         default=False,
-        description="是否记录未通过聊天名单过滤而被丢弃的消息。",
+        description="是否展示未通过聊天名单过滤而被丢弃的消息。",
         json_schema_extra={
             "hint": "关闭后不记录群聊/私聊名单丢弃日志，默认关闭以减少刷屏。",
             "i18n": _schema_i18n(
@@ -365,7 +364,7 @@ class SnowLumaChatSection(PluginConfigBase):
         default_factory=list,
         description="全局屏蔽的用户 ID 列表。",
         json_schema_extra={
-            "hint": "这些用户的消息会在进入 Host 之前被直接丢弃。",
+            "hint": "这些用户的消息会被直接丢弃。",
             "i18n": _schema_i18n(
                 label_en="Globally blocked users",
                 label_ja="全体ブロックユーザー",
@@ -432,9 +431,9 @@ class SnowLumaFilterSection(PluginConfigBase):
 
     ignore_self_message: bool = Field(
         default=True,
-        description="是否忽略机器人自身发送的消息。",
+        description="是否忽略手动用bot账号发送的消息。",
         json_schema_extra={
-            "hint": "建议保持开启，避免机器人处理自己刚刚发出的消息。",
+            "hint": "如果人类使用bot账号手动发送消息，开启此项后，不处理这类消息",
             "i18n": _schema_i18n(
                 label_en="Ignore self messages",
                 label_ja="自身のメッセージを無視",
@@ -996,6 +995,16 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         await self._ws.send_str(json.dumps(payload, ensure_ascii=False))
         try:
             return await asyncio.wait_for(future, timeout=max(1.0, settings.luma_client.action_timeout_sec))
+        except asyncio.TimeoutError as exc:
+            timeout_seconds = max(1.0, settings.luma_client.action_timeout_sec)
+            self.ctx.logger.warning(
+                "SnowLuma action 等待响应超时，准备断开旧连接并触发重连: action=%s timeout=%.1fs",
+                action,
+                timeout_seconds,
+            )
+            await self._report_gateway_ready(False, settings=settings)
+            await self._disconnect()
+            raise TimeoutError(f"SnowLuma action {action} 响应超时（{timeout_seconds:.1f}s）") from exc
         finally:
             self._response_pool.pop(echo, None)
 
