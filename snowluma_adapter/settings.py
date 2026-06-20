@@ -7,7 +7,7 @@ from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.3"
+SUPPORTED_CONFIG_VERSION = "1.0.4"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
 VOICE_TRANSCODE_SAMPLE_RATE = 24000
@@ -404,11 +404,136 @@ class SnowLumaChatSection(PluginConfigBase):
         return normalized_values
 
 
+def _notice_field(
+    *,
+    label: str,
+    description: str,
+    order: int,
+    label_en: str,
+    label_ja: str,
+) -> Any:
+    return Field(
+        default=True,
+        description=description,
+        json_schema_extra={
+            "label": label,
+            "hint": description,
+            "i18n": _schema_i18n(
+                label_en=label_en,
+                label_ja=label_ja,
+                hint_en=description,
+                hint_ja=description,
+            ),
+            "order": order,
+        },
+    )
+
+
+class SnowLumaNoticeSection(PluginConfigBase):
+    """通知事件传递配置。"""
+
+    __ui_label__: ClassVar[str] = "通知事件"
+    __ui_order__: ClassVar[int] = 3
+
+    enabled: bool = Field(
+        default=True,
+        description="是否将 SnowLuma 推送的通知事件转发给 MaiBot。",
+        json_schema_extra={
+            "label": "启用通知事件",
+            "hint": "关闭后，戳一戳、禁言、撤回、入群退群等通知事件都不会传入 MaiBot。",
+            "i18n": _schema_i18n(
+                label_en="Enable notice events",
+                label_ja="通知イベントを有効化",
+                hint_en="When disabled, poke, ban, recall, member change and other notice events are not routed to MaiBot.",
+                hint_ja="無効にすると、poke、禁言、撤回、メンバー変更などの通知イベントは MaiBot に転送されません。",
+            ),
+            "order": 0,
+        },
+    )
+    enable_poke: bool = _notice_field(
+        label="传递戳一戳",
+        description="是否传递戳一戳通知。",
+        order=1,
+        label_en="Route poke",
+        label_ja="poke を転送",
+    )
+    enable_friend_recall: bool = _notice_field(
+        label="传递好友撤回",
+        description="是否传递好友消息撤回通知。",
+        order=2,
+        label_en="Route friend recall",
+        label_ja="友達の撤回を転送",
+    )
+    enable_group_recall: bool = _notice_field(
+        label="传递群消息撤回",
+        description="是否传递群消息撤回通知。",
+        order=3,
+        label_en="Route group recall",
+        label_ja="グループ撤回を転送",
+    )
+    enable_group_ban: bool = _notice_field(
+        label="传递禁言",
+        description="是否传递群禁言和解除禁言通知。",
+        order=4,
+        label_en="Route group ban",
+        label_ja="グループ禁言を転送",
+    )
+    enable_group_msg_emoji_like: bool = _notice_field(
+        label="传递消息表情回应",
+        description="是否传递群消息表情回应通知。",
+        order=5,
+        label_en="Route emoji reactions",
+        label_ja="絵文字リアクションを転送",
+    )
+    enable_group_upload: bool = _notice_field(
+        label="传递群文件上传",
+        description="是否传递群文件上传通知。",
+        order=6,
+        label_en="Route group uploads",
+        label_ja="グループファイルを転送",
+    )
+    enable_group_increase: bool = _notice_field(
+        label="传递入群",
+        description="是否传递群成员增加通知。",
+        order=7,
+        label_en="Route member joins",
+        label_ja="参加通知を転送",
+    )
+    enable_group_decrease: bool = _notice_field(
+        label="传递退群",
+        description="是否传递群成员减少通知。",
+        order=8,
+        label_en="Route member leaves",
+        label_ja="退出通知を転送",
+    )
+    enable_group_admin: bool = _notice_field(
+        label="传递管理员变动",
+        description="是否传递群管理员变动通知。",
+        order=9,
+        label_en="Route admin changes",
+        label_ja="管理者変更を転送",
+    )
+    enable_essence: bool = _notice_field(
+        label="传递精华消息",
+        description="是否传递精华消息变动通知。",
+        order=10,
+        label_en="Route essence changes",
+        label_ja="精華メッセージを転送",
+    )
+    enable_group_name: bool = _notice_field(
+        label="传递群名变更",
+        description="是否传递群名称变更通知。",
+        order=11,
+        label_en="Route group name changes",
+        label_ja="グループ名変更を転送",
+    )
+
+
 class SnowLumaFilterSection(PluginConfigBase):
     """消息过滤配置。"""
 
     __ui_label__: ClassVar[str] = "消息过滤"
-    __ui_order__: ClassVar[int] = 3
+    __ui_order__: ClassVar[int] = 4
 
     ignore_self_message: bool = Field(
         default=True,
@@ -433,6 +558,7 @@ class SnowLumaAdapterSettings(PluginConfigBase):
     plugin: SnowLumaPluginSection = Field(default_factory=SnowLumaPluginSection)
     luma_client: SnowLumaClientSection = Field(default_factory=SnowLumaClientSection)
     chat: SnowLumaChatSection = Field(default_factory=SnowLumaChatSection)
+    notice: SnowLumaNoticeSection = Field(default_factory=SnowLumaNoticeSection)
     filters: SnowLumaFilterSection = Field(default_factory=SnowLumaFilterSection)
 
     def should_connect(self) -> bool:

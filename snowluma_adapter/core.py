@@ -650,6 +650,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             await self._update_connected_account(self_id)
         if post_type == "message" or "message" in payload:
             asyncio.create_task(self._route_inbound_message(payload), name="snowluma-route-message")
+            return
+        if post_type == "notice":
+            asyncio.create_task(self._route_inbound_notice(payload), name="snowluma-route-notice")
 
     async def _update_connected_account(self, account_id: str) -> None:
         """从 SnowLuma 推送中更新当前账号 ID。"""
@@ -850,6 +853,35 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not accepted:
             self.ctx.logger.debug(f"Host 丢弃了 SnowLuma 入站消息: {external_message_id or '无消息 ID'}")
 
+    async def _route_inbound_notice(self, payload: Dict[str, Any]) -> None:
+        """将 SnowLuma 通知事件转换为 Host 标准通知消息并注入。"""
+
+        if not self._is_inbound_notice_allowed(payload):
+            return
+
+        try:
+            message_dict = await self._build_inbound_notice_message_dict(payload)
+        except ValueError as exc:
+            self.ctx.logger.warning(f"SnowLuma 通知事件格式不受支持，已丢弃: {exc}")
+            return
+
+        notice_message_id = str(message_dict.get("message_id") or "").strip()
+        route_metadata: Dict[str, Any] = {}
+        if self._connected_account_id:
+            route_metadata["self_id"] = self._connected_account_id
+        if connection_id := self._load_settings().luma_client.connection_id:
+            route_metadata["connection_id"] = connection_id
+
+        accepted = await self.ctx.gateway.route_message(
+            gateway_name=SNOWLUMA_GATEWAY_NAME,
+            message=message_dict,
+            route_metadata=route_metadata,
+            external_message_id=notice_message_id,
+            dedupe_key=notice_message_id,
+        )
+        if not accepted:
+            self.ctx.logger.debug(f"Host 丢弃了 SnowLuma 通知事件: {notice_message_id or '无通知 ID'}")
+
     def _is_inbound_message_allowed(self, payload: Mapping[str, Any]) -> bool:
         """检查入站消息是否通过聊天黑白名单过滤。"""
 
@@ -943,6 +975,362 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         sender_title = str(sender.get("title") or sender.get("card") or sender.get("nickname") or "").lower()
         return "官方机器人" in sender_title or "qq bot" in sender_title
+
+    def _is_inbound_notice_allowed(self, payload: Mapping[str, Any]) -> bool:
+        """检查通知事件是否通过聊天黑白名单过滤。"""
+
+        settings = self._load_settings()
+        if not settings.notice.enabled:
+            return False
+
+        group_id = str(payload.get("group_id") or "").strip()
+        actor_user_id = self._resolve_notice_actor_user_id(payload)
+
+        if actor_user_id and actor_user_id in settings.chat.ban_user_id:
+            self.ctx.logger.warning(f"SnowLuma 用户 {actor_user_id} 在全局禁止名单中，通知已丢弃")
+            return False
+
+        if not settings.chat.enable_chat_list_filter:
+            return True
+
+        if group_id:
+            allowed = self._is_id_allowed_by_list_policy(
+                group_id,
+                settings.chat.group_list_type,
+                settings.chat.group_list,
+            )
+            if not allowed:
+                self._log_chat_list_rejection(
+                    settings.chat.show_dropped_chat_list_messages,
+                    f"SnowLuma 群聊 {group_id} 的通知未通过聊天名单过滤，通知已丢弃",
+                )
+            return allowed
+
+        if not actor_user_id:
+            return False
+
+        allowed = self._is_id_allowed_by_list_policy(
+            actor_user_id,
+            settings.chat.private_list_type,
+            settings.chat.private_list,
+        )
+        if not allowed:
+            self._log_chat_list_rejection(
+                settings.chat.show_dropped_chat_list_messages,
+                f"SnowLuma 私聊用户 {actor_user_id} 的通知未通过聊天名单过滤，通知已丢弃",
+            )
+        return allowed
+
+    async def _build_inbound_notice_message_dict(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """构造 Host 可接受的通知 MessageDict。"""
+
+        notice_type = str(payload.get("notice_type") or "").strip()
+        sub_type = str(payload.get("sub_type") or "").strip()
+        if not notice_type:
+            raise ValueError("缺少 notice_type")
+        if not self._is_notice_event_enabled(notice_type, sub_type):
+            raise ValueError(f"通知类型已关闭: {notice_type}.{sub_type or '<empty>'}")
+
+        plain_text = await self._build_notice_plain_text(payload, notice_type, sub_type)
+        if not plain_text:
+            raise ValueError(f"不支持的通知类型: {notice_type}.{sub_type or '<empty>'}")
+
+        group_id = str(payload.get("group_id") or "").strip()
+        actor_user_id = self._resolve_notice_actor_user_id(payload) or "0"
+        user_profile = await self._resolve_notice_user_profile(group_id, actor_user_id)
+        user_nickname = user_profile.get("nickname") or actor_user_id or "系统通知"
+        user_cardname = user_profile.get("card") or None
+
+        timestamp_seconds = payload.get("time")
+        if not isinstance(timestamp_seconds, (int, float)) or timestamp_seconds <= 0:
+            timestamp_seconds = time.time()
+
+        additional_config: Dict[str, Any] = {
+            "self_id": self._connected_account_id,
+            "snowluma_message_type": "notice",
+            "snowluma_notice_type": notice_type,
+            "snowluma_notice_sub_type": sub_type,
+            "snowluma_notice_payload": dict(payload),
+            # 兼容已有 NapCat 通知字段命名，便于主程序统一读取。
+            "napcat_notice_type": notice_type,
+            "napcat_notice_sub_type": sub_type,
+            "napcat_notice_payload": dict(payload),
+        }
+        target_id = str(payload.get("target_id") or "").strip()
+        if target_id:
+            additional_config["target_id"] = target_id
+        if group_id:
+            additional_config["platform_io_target_group_id"] = group_id
+        else:
+            additional_config["platform_io_target_user_id"] = actor_user_id
+
+        message_info: Dict[str, Any] = {
+            "user_info": {
+                "user_id": actor_user_id,
+                "user_nickname": user_nickname,
+                "user_cardname": user_cardname,
+            },
+            "additional_config": additional_config,
+        }
+        if group_id:
+            group_name = await self._resolve_group_name(payload, group_id)
+            message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
+
+        return {
+            "message_id": self._build_notice_message_id(payload, notice_type, sub_type),
+            "timestamp": str(float(timestamp_seconds)),
+            "platform": "qq",
+            "message_info": message_info,
+            "raw_message": [{"type": "text", "data": plain_text}],
+            "is_mentioned": False,
+            "is_at": False,
+            "is_emoji": False,
+            "is_picture": False,
+            "is_command": False,
+            "is_notify": True,
+            "session_id": "",
+            "processed_plain_text": plain_text,
+        }
+
+    @staticmethod
+    def _build_notice_message_id(payload: Mapping[str, Any], notice_type: str, sub_type: str) -> str:
+        """为通知事件生成唯一消息 ID，避免多条通知共用 ``notice``。"""
+
+        stable_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()[:16]
+        normalized_type = notice_type or "notice"
+        normalized_sub_type = sub_type or "event"
+        return f"notice:{normalized_type}:{normalized_sub_type}:{digest}"
+
+    def _is_notice_event_enabled(self, notice_type: str, sub_type: str) -> bool:
+        """按配置判断指定通知类型是否允许传递。"""
+
+        notice_settings = self._load_settings().notice
+        if notice_type == "notify":
+            if sub_type == "poke":
+                return notice_settings.enable_poke
+            if sub_type == "group_name":
+                return notice_settings.enable_group_name
+            return False
+
+        notice_type_fields = {
+            "friend_recall": "enable_friend_recall",
+            "group_recall": "enable_group_recall",
+            "group_ban": "enable_group_ban",
+            "group_msg_emoji_like": "enable_group_msg_emoji_like",
+            "group_upload": "enable_group_upload",
+            "group_increase": "enable_group_increase",
+            "group_decrease": "enable_group_decrease",
+            "group_admin": "enable_group_admin",
+            "essence": "enable_essence",
+        }
+        field_name = notice_type_fields.get(notice_type)
+        if field_name is None:
+            return False
+        return bool(getattr(notice_settings, field_name))
+
+    @staticmethod
+    def _resolve_notice_actor_user_id(payload: Mapping[str, Any]) -> str:
+        """解析通知事件的操作者 ID。"""
+
+        for field_name in ("operator_id", "user_id", "sender_id", "target_id", "self_id"):
+            value = str(payload.get(field_name) or "").strip()
+            if value:
+                return value
+        return ""
+
+    async def _resolve_notice_user_profile(self, group_id: str, user_id: str) -> Dict[str, str]:
+        """解析通知事件中的用户昵称和群名片。"""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id or normalized_user_id == "0":
+            return {"nickname": "系统通知"}
+
+        if group_id:
+            resolved_names = await self._resolve_group_member_names(group_id, normalized_user_id)
+            if resolved_names:
+                return resolved_names
+
+        try:
+            response = await self._call_action(
+                "get_stranger_info",
+                {"user_id": self._normalize_positive_id(normalized_user_id, "user_id")},
+            )
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 查询用户信息失败: user_id={normalized_user_id} error={exc}")
+            return {"nickname": normalized_user_id}
+
+        user_info = response.get("data", response)
+        if not isinstance(user_info, Mapping):
+            return {"nickname": normalized_user_id}
+
+        nickname = str(user_info.get("nickname") or user_info.get("name") or normalized_user_id).strip()
+        return {"nickname": nickname or normalized_user_id}
+
+    async def _resolve_notice_display_name(self, group_id: str, user_id: Any, *, default: str = "QQ用户") -> str:
+        """解析通知文本中展示用的用户名。"""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return default
+        if normalized_user_id == "0":
+            return "全体成员"
+
+        user_profile = await self._resolve_notice_user_profile(group_id, normalized_user_id)
+        return user_profile.get("card") or user_profile.get("nickname") or normalized_user_id
+
+    async def _build_notice_plain_text(self, payload: Mapping[str, Any], notice_type: str, sub_type: str) -> str:
+        """将 OneBot 通知事件渲染成麦麦可读文本。"""
+
+        group_id = str(payload.get("group_id") or "").strip()
+        if notice_type == "notify":
+            if sub_type == "poke":
+                return await self._build_poke_notice_text(payload, group_id)
+            if sub_type == "group_name":
+                new_name = str(payload.get("name_new") or payload.get("group_name") or "").strip()
+                return f"[事件-群名变更] 群名称变更为 {new_name or '未知名称'}"
+            return ""
+
+        if notice_type == "friend_recall":
+            user_name = await self._resolve_notice_display_name("", payload.get("user_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            return f"[事件-好友撤回] {user_name} 撤回了一条消息{suffix}"
+
+        if notice_type == "group_recall":
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            if operator_name and user_name and operator_name != user_name:
+                return f"[事件-群消息撤回] {operator_name} 撤回了 {user_name} 的消息{suffix}"
+            return f"[事件-群消息撤回] {operator_name or user_name} 撤回了一条消息{suffix}"
+
+        if notice_type == "group_ban":
+            return await self._build_group_ban_notice_text(payload, group_id, sub_type)
+
+        if notice_type == "group_msg_emoji_like":
+            return await self._build_emoji_like_notice_text(payload, group_id)
+
+        if notice_type == "group_upload":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            file_info = payload.get("file", {})
+            if not isinstance(file_info, Mapping):
+                file_info = {}
+            file_name = str(file_info.get("name") or file_info.get("file") or "未知文件").strip()
+            file_size = str(file_info.get("size") or file_info.get("file_size") or "").strip()
+            size_suffix = f"，大小 {file_size}" if file_size else ""
+            return f"[事件-群文件上传] {user_name} 上传了文件 {file_name}{size_suffix}"
+
+        if notice_type == "group_increase":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            increase_type = sub_type or str(payload.get("increase_type") or "").strip()
+            action_text = "被邀请入群" if increase_type == "invite" else "加入了群聊"
+            return f"[事件-群成员增加] {user_name} {action_text}"
+
+        if notice_type == "group_decrease":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            if sub_type == "kick_me":
+                return "[事件-群成员减少] 麦麦被移出了群聊"
+            if sub_type == "kick":
+                return f"[事件-群成员减少] {user_name} 被 {operator_name} 移出了群聊"
+            return f"[事件-群成员减少] {user_name} 离开了群聊"
+
+        if notice_type == "group_admin":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            action_text = "被设为管理员" if sub_type == "set" else "被取消管理员"
+            return f"[事件-群管理员变动] {user_name} {action_text}"
+
+        if notice_type == "essence":
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            sender_name = await self._resolve_notice_display_name(group_id, payload.get("sender_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            if sub_type == "add":
+                return f"[事件-精华消息] {operator_name} 将 {sender_name} 的消息设为精华{suffix}"
+            if sub_type == "delete":
+                return f"[事件-精华消息] {operator_name} 移除了 {sender_name} 的精华消息{suffix}"
+            return f"[事件-精华消息] 精华消息发生变动{suffix}"
+
+        return ""
+
+    async def _build_poke_notice_text(self, payload: Mapping[str, Any], group_id: str) -> str:
+        """构造戳一戳通知文本。"""
+
+        self_id = str(payload.get("self_id") or self._connected_account_id or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        target_id = str(payload.get("target_id") or "").strip()
+        if self_id and user_id == self_id:
+            return ""
+
+        user_name = await self._resolve_notice_display_name(group_id, user_id)
+        target_name = await self._resolve_notice_display_name(group_id, target_id, default="麦麦")
+
+        first_text = "戳了戳"
+        second_text = ""
+        raw_info = payload.get("raw_info")
+        if isinstance(raw_info, list):
+            first_text = self._extract_poke_raw_text(raw_info, 2, first_text)
+            second_text = self._extract_poke_raw_text(raw_info, 4, second_text)
+
+        if self_id and target_id == self_id:
+            display_name = ""
+        elif group_id:
+            display_name = user_name
+        else:
+            return ""
+
+        return f"{display_name}{first_text}{target_name}{second_text}（这是QQ的一个功能，用于提及某人，但没那么明显）"
+
+    @staticmethod
+    def _extract_poke_raw_text(raw_info: List[Any], index: int, default: str) -> str:
+        """从戳一戳 raw_info 中提取动作文本。"""
+
+        if index >= len(raw_info):
+            return default
+        raw_item = raw_info[index]
+        if not isinstance(raw_item, Mapping):
+            return default
+        return str(raw_item.get("txt") or default)
+
+    async def _build_group_ban_notice_text(self, payload: Mapping[str, Any], group_id: str, sub_type: str) -> str:
+        """构造群禁言通知文本。"""
+
+        operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+        target_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+        duration = payload.get("duration")
+        if sub_type == "ban":
+            if str(payload.get("user_id") or "").strip() == "0":
+                return f"[事件-群禁言] {operator_name} 开启了全员禁言"
+            duration_text = f"，时长 {duration} 秒" if duration not in (None, "") else ""
+            return f"[事件-群禁言] {operator_name} 禁言了 {target_name}{duration_text}"
+        if sub_type == "lift_ban":
+            if str(payload.get("user_id") or "").strip() == "0":
+                return f"[事件-群禁言] {operator_name} 解除了全员禁言"
+            return f"[事件-群禁言] {operator_name} 解除了 {target_name} 的禁言"
+        return ""
+
+    async def _build_emoji_like_notice_text(self, payload: Mapping[str, Any], group_id: str) -> str:
+        """构造群消息表情回应通知文本。"""
+
+        user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+        likes = payload.get("likes", [])
+        emoji_texts: List[str] = []
+        if isinstance(likes, list):
+            for like in likes:
+                if not isinstance(like, Mapping):
+                    continue
+                emoji_id = str(like.get("emoji_id") or "").strip()
+                count = like.get("count", 1)
+                emoji_text = QQ_FACE_DESCRIPTIONS.get(emoji_id, f"未知表情{emoji_id}") if emoji_id else "未知表情"
+                if count and count != 1:
+                    emoji_texts.append(f"[{emoji_text}]x{count}")
+                else:
+                    emoji_texts.append(f"[{emoji_text}]")
+        emoji_summary = "、".join(emoji_texts) if emoji_texts else "未知表情"
+        message_id = str(payload.get("message_id") or "").strip()
+        return f"[事件-群消息表情回应] {user_name} 对消息(ID:{message_id or '未知'})表达了 {emoji_summary}"
 
     async def _build_inbound_message_dict(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         """构造 Host 可接受的 MessageDict。"""
