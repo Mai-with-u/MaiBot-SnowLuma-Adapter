@@ -1,7 +1,11 @@
 # MaiBot SnowLuma Adapter
-本项目是对接SnowLuma的适配器，支持两种工作格式
-- 直接使用MaiBot的maim_message库进行连接
-- 作为Adapter插件被MaiBot加载
+本项目是对接 SnowLuma 的 MaiBot 适配器插件，仅支持作为 Adapter 插件被 MaiBot 加载。
+
+## 0.7.0更新
+
+- 支持发送转发消息
+- 支持撤回消息
+- 兼容napcat的一些接口
 
 ## 主动私聊工具
 
