@@ -1,6 +1,10 @@
 # MaiBot SnowLuma Adapter
 本项目是对接 SnowLuma 的 MaiBot 适配器插件，仅支持作为 Adapter 插件被 MaiBot 加载。
 
+## 0.7.2更新
+
+- 修复表情包出站消息被 SnowLuma 按普通图片发送的问题，现在会按 OneBot 表情包 subtype 发送。
+
 ## 0.7.1更新
 
 - 支持通知信息获取

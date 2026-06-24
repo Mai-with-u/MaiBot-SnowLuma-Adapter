@@ -2460,8 +2460,21 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     self.ctx.logger.debug(f"SnowLuma 跳过无效回复目标消息 ID: {target_message_id}")
                 continue
 
-            if item_type in {"image", "emoji"}:
-                image_segment = self._build_media_segment("image", item)
+            if item_type == "image":
+                image_segment = self._build_media_segment("image", item, {"sub_type": 0})
+                if image_segment:
+                    segments.append(image_segment)
+                continue
+
+            if item_type == "emoji":
+                image_segment = self._build_media_segment(
+                    "image",
+                    item,
+                    {
+                        "sub_type": 1,
+                        "summary": "[动画表情]",
+                    },
+                )
                 if image_segment:
                     segments.append(image_segment)
                 continue
@@ -2476,12 +2489,21 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         return segments
 
     @staticmethod
-    def _build_media_segment(segment_type: str, item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    def _build_media_segment(
+        segment_type: str,
+        item: Mapping[str, Any],
+        extra_data: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """构造 OneBot 媒体消息段。"""
+
+        segment_data: Dict[str, Any] = {}
+        if extra_data:
+            segment_data.update(extra_data)
 
         binary_base64 = str(item.get("binary_data_base64") or "").strip()
         if binary_base64:
-            return {"type": segment_type, "data": {"file": f"base64://{binary_base64}"}}
+            segment_data["file"] = f"base64://{binary_base64}"
+            return {"type": segment_type, "data": segment_data}
 
         item_data = item.get("data")
         file_reference = ""
@@ -2495,7 +2517,8 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         if not file_reference.startswith(("base64://", "file://", "http://", "https://")):
             file_reference = f"file://{file_reference}"
-        return {"type": segment_type, "data": {"file": file_reference}}
+        segment_data["file"] = file_reference
+        return {"type": segment_type, "data": segment_data}
 
     @staticmethod
     def _normalize_outbound_reply_id(message_id: str) -> Optional[str]:
