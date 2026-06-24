@@ -222,6 +222,28 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         del kwargs
         return await self._call_action("get_login_info", {})
 
+    @API("adapter.napcat.message.get_msg", description="按消息 ID 获取消息", version="1", public=True)
+    async def api_get_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 message_id 实时取回消息（含图片段，URL 由本体刷新有效 rkey）。
+
+        供下游插件追溯被引用消息取图，不依赖任何本地消息库缓存。
+        message_id 允许为负（OneBot 32 位有符号回绕值）。
+        """
+        params = kwargs.get("params", kwargs)
+        return await self._call_action(
+            "get_msg",
+            {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
+        )
+
+    @API("adapter.napcat.file.get_image", description="按文件引用获取图片信息", version="1", public=True)
+    async def api_get_image(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 file/file_id 解析图片信息（含可下载 URL）。"""
+        params = kwargs.get("params", kwargs)
+        file_ref = str(params.get("file") or params.get("file_id") or "").strip()
+        if not file_ref:
+            raise ValueError("file 不能为空")
+        return await self._call_action("get_image", {"file": file_ref})
+
     @Tool(
         "open_private_chat",
         description=(
