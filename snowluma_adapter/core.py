@@ -119,10 +119,219 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             "data": response.get("data"),
         }
 
+    @staticmethod
+    def _api_params(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+        """兼容直接传参和 NapCat 风格 ``params`` 包装。"""
+
+        raw_params = kwargs.get("params", kwargs)
+        if raw_params is None:
+            return {}
+        if not isinstance(raw_params, Mapping):
+            raise ValueError("params 必须是字典")
+        return dict(raw_params)
+
+    async def _call_passthrough_action(self, action: str, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+        """透传调用 SnowLuma OneBot action。"""
+
+        return await self._call_action(action, self._api_params(kwargs))
+
+    @API("adapter.napcat.account.get_friend_list", description="获取好友列表", version="1", public=True)
+    async def api_get_friend_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取好友列表。"""
+
+        del kwargs
+        return await self._call_action("get_friend_list", {})
+
+    @API("adapter.napcat.account.get_stranger_info", description="获取陌生人信息", version="1", public=True)
+    async def api_get_stranger_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取陌生人信息。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_stranger_info",
+            {"user_id": self._normalize_positive_id(params.get("user_id"), "user_id")},
+        )
+
+    @API("adapter.napcat.account.get_profile_like", description="获取资料点赞", version="1", public=True)
+    async def api_get_profile_like(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取资料点赞。"""
+
+        return await self._call_passthrough_action("get_profile_like", kwargs)
+
+    @API("adapter.napcat.account.ocr_image", description="图片 OCR 识别", version="1", public=True)
+    async def api_ocr_image(self, **kwargs: Any) -> Dict[str, Any]:
+        """图片 OCR 识别。"""
+
+        return await self._call_passthrough_action("ocr_image", kwargs)
+
+    @API("adapter.napcat.account.send_like", description="点赞", version="1", public=True)
+    async def api_send_like(self, **kwargs: Any) -> Dict[str, Any]:
+        """给指定用户点赞。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "send_like",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "times": int(params.get("times", 1)),
+            },
+        )
+
+    @API("adapter.napcat.account.set_qq_profile", description="设置 QQ 账号资料", version="1", public=True)
+    async def api_set_qq_profile(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置 QQ 账号资料。"""
+
+        params = self._api_params(kwargs)
+        action_params: Dict[str, Any] = {}
+        if "nickname" in params:
+            action_params["nickname"] = str(params.get("nickname") or "")
+        if "personal_note" in params:
+            action_params["personal_note"] = str(params.get("personal_note") or "")
+        return await self._call_action("set_qq_profile", action_params)
+
+    @API("adapter.napcat.account.set_qq_avatar", description="设置 QQ 头像", version="1", public=True)
+    async def api_set_qq_avatar(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置 QQ 头像。"""
+
+        return await self._call_passthrough_action("set_qq_avatar", kwargs)
+
+    @API("adapter.napcat.account.set_self_longnick", description="设置个性签名", version="1", public=True)
+    async def api_set_self_longnick(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置个性签名。"""
+
+        return await self._call_passthrough_action("set_self_longnick", kwargs)
+
+    @API("adapter.napcat.account.set_diy_online_status", description="设置自定义在线状态", version="1", public=True)
+    async def api_set_diy_online_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置自定义在线状态。"""
+
+        return await self._call_passthrough_action("set_diy_online_status", kwargs)
+
+    @API("adapter.napcat.group.get_group_list", description="获取群列表", version="1", public=True)
+    async def api_get_group_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群列表。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action("get_group_list", {"no_cache": bool(params.get("no_cache", False))})
+
+    @API("adapter.napcat.group.get_group_info", description="获取群信息", version="1", public=True)
+    async def api_get_group_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群信息。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_info",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "no_cache": bool(params.get("no_cache", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.get_group_member_list", description="获取群成员列表", version="1", public=True)
+    async def api_get_group_member_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群成员列表。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_member_list",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "no_cache": bool(params.get("no_cache", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_kick", description="踢出单个群成员", version="1", public=True)
+    async def api_set_group_kick(self, **kwargs: Any) -> Dict[str, Any]:
+        """踢出单个群成员。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "set_group_kick",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "reject_add_request": bool(params.get("reject_add_request", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_card", description="设置群名片", version="1", public=True)
+    async def api_set_group_card(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置群名片。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "set_group_card",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "card": str(params.get("card") or ""),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_name", description="设置群名称", version="1", public=True)
+    async def api_set_group_name(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置群名称。"""
+
+        params = self._api_params(kwargs)
+        group_name = str(params.get("group_name") or "").strip()
+        if not group_name:
+            raise ValueError("group_name 不能为空")
+        return await self._call_action(
+            "set_group_name",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "group_name": group_name,
+            },
+        )
+
+    @API("adapter.napcat.file.get_record", description="获取语音文件详情", version="1", public=True)
+    async def api_get_record(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取语音文件详情。"""
+
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or params.get("file_id") or "").strip()
+        if not file_ref:
+            raise ValueError("file 或 file_id 至少提供一个")
+        return await self._call_action("get_record", {"file": file_ref})
+
+    @API("adapter.napcat.file.get_group_file_url", description="获取群文件 URL", version="1", public=True)
+    async def api_get_group_file_url(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群文件下载链接。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_file_url",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "file_id": str(params.get("file_id") or "").strip(),
+                "busid": int(params.get("busid", 102)),
+            },
+        )
+
+    @API("adapter.napcat.file.upload_group_file", description="上传群文件", version="1", public=True)
+    async def api_upload_group_file(self, **kwargs: Any) -> Dict[str, Any]:
+        """上传群文件。"""
+
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or "").strip()
+        if not file_ref:
+            raise ValueError("file 不能为空")
+        return await self._call_action(
+            "upload_group_file",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "file": file_ref,
+                "name": str(params.get("name") or ""),
+                "folder": str(params.get("folder") or ""),
+                "folder_id": str(params.get("folder_id") or ""),
+                "upload_file": bool(params.get("upload_file", True)),
+            },
+        )
+
     @API("adapter.napcat.message.send_group_msg", description="发送群消息", version="1", public=True)
     async def api_send_group_msg(self, **kwargs: Any) -> Dict[str, Any]:
         """发送群消息（OneBot message 段数组）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         message = params.get("message")
         if not isinstance(message, list) or not message:
             raise ValueError("message 必须是非空的消息段数组")
@@ -138,7 +347,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.send_private_msg", description="发送私聊消息", version="1", public=True)
     async def api_send_private_msg(self, **kwargs: Any) -> Dict[str, Any]:
         """发送私聊消息（OneBot message 段数组）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         message = params.get("message")
         if not isinstance(message, list) or not message:
             raise ValueError("message 必须是非空的消息段数组")
@@ -154,7 +363,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.send_group_forward_msg", description="发送群合并转发消息", version="1", public=True)
     async def api_send_group_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
         """发送群合并转发消息（OneBot node 段数组）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         messages = params.get("messages") or params.get("message")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages 必须是非空的转发节点数组")
@@ -170,7 +379,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.send_private_forward_msg", description="发送私聊合并转发消息", version="1", public=True)
     async def api_send_private_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
         """发送私聊合并转发消息（OneBot node 段数组）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         messages = params.get("messages") or params.get("message")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages 必须是非空的转发节点数组")
@@ -186,7 +395,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.delete_msg", description="撤回消息", version="1", public=True)
     async def api_delete_msg(self, **kwargs: Any) -> Dict[str, Any]:
         """撤回消息。message_id 允许为负（OneBot 32 位有符号回绕值）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         return await self._call_action(
             "delete_msg",
             {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
@@ -195,7 +404,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.get_group_msg_history", description="获取群消息历史", version="1", public=True)
     async def api_get_group_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
         """获取群消息历史。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         return await self._call_action(
             "get_group_msg_history",
             {
@@ -207,7 +416,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     @API("adapter.napcat.message.get_friend_msg_history", description="获取私聊消息历史", version="1", public=True)
     async def api_get_friend_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
         """获取私聊消息历史。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         return await self._call_action(
             "get_friend_msg_history",
             {
@@ -229,20 +438,107 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         供下游插件追溯被引用消息取图，不依赖任何本地消息库缓存。
         message_id 允许为负（OneBot 32 位有符号回绕值）。
         """
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         return await self._call_action(
             "get_msg",
             {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
         )
 
+    @API("adapter.napcat.message.get_forward_msg", description="获取合并转发消息", version="1", public=True)
+    async def api_get_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取合并转发消息详情。"""
+
+        params = self._api_params(kwargs)
+        forward_id = str(params.get("id") or params.get("message_id") or "").strip()
+        if not forward_id:
+            raise ValueError("message_id 或 id 至少提供一个")
+        return await self._call_action("get_forward_msg", {"id": forward_id})
+
+    @API("adapter.napcat.message.send_msg", description="发送消息", version="1", public=True)
+    async def api_send_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 message_type/group_id 自动发送群聊或私聊消息。"""
+
+        params = self._api_params(kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action("send_msg", params)
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_poke", description="发送戳一戳", version="1", public=True)
+    async def api_send_poke(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送戳一戳。"""
+
+        params = self._api_params(kwargs)
+        raw_user_id = params.get("user_id") or params.get("qq_id") or params.get("target_id")
+        action_params: Dict[str, Any] = {"user_id": self._normalize_positive_id(raw_user_id, "user_id")}
+        raw_group_id = params.get("group_id")
+        if raw_group_id is not None and str(raw_group_id).strip():
+            action_params["group_id"] = self._normalize_positive_id(raw_group_id, "group_id")
+        return await self._call_action("send_poke", action_params)
+
     @API("adapter.napcat.file.get_image", description="按文件引用获取图片信息", version="1", public=True)
     async def api_get_image(self, **kwargs: Any) -> Dict[str, Any]:
         """按 file/file_id 解析图片信息（含可下载 URL）。"""
-        params = kwargs.get("params", kwargs)
+        params = self._api_params(kwargs)
         file_ref = str(params.get("file") or params.get("file_id") or "").strip()
         if not file_ref:
             raise ValueError("file 不能为空")
         return await self._call_action("get_image", {"file": file_ref})
+
+    @API("adapter.napcat.qzone.get_qzone_msg_list", description="获取 QQ 空间说说列表", version="1", public=True)
+    async def api_get_qzone_msg_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 QQ 空间说说列表。"""
+
+        return await self._call_passthrough_action("get_qzone_msg_list", kwargs)
+
+    @API("adapter.napcat.qzone.get_qzone_feeds", description="获取 QQ 空间好友动态", version="1", public=True)
+    async def api_get_qzone_feeds(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 QQ 空间好友动态。"""
+
+        return await self._call_passthrough_action("get_qzone_feeds", kwargs)
+
+    @API("adapter.napcat.qzone.send_qzone_msg", description="发表 QQ 空间说说", version="1", public=True)
+    async def api_send_qzone_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发表 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("send_qzone_msg", kwargs)
+
+    @API("adapter.napcat.qzone.delete_qzone_msg", description="删除 QQ 空间说说", version="1", public=True)
+    async def api_delete_qzone_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """删除 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("delete_qzone_msg", kwargs)
+
+    @API("adapter.napcat.qzone.like_qzone", description="点赞 QQ 空间说说", version="1", public=True)
+    async def api_like_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """点赞 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("like_qzone", kwargs)
+
+    @API("adapter.napcat.qzone.unlike_qzone", description="取消点赞 QQ 空间说说", version="1", public=True)
+    async def api_unlike_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """取消点赞 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("unlike_qzone", kwargs)
+
+    @API("adapter.napcat.qzone.comment_qzone", description="评论 QQ 空间说说", version="1", public=True)
+    async def api_comment_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """评论 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("comment_qzone", kwargs)
+
+    @API("adapter.napcat.system.set_input_status", description="设置输入状态", version="1", public=True)
+    async def api_set_input_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置输入状态。"""
+
+        return await self._call_passthrough_action("set_input_status", kwargs)
+
+    @API("adapter.napcat.system.set_online_status", description="设置在线状态", version="1", public=True)
+    async def api_set_online_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置在线状态。"""
+
+        return await self._call_passthrough_action("set_online_status", kwargs)
 
     @Tool(
         "open_private_chat",
@@ -1382,7 +1678,11 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 f"message={json.dumps(inbound_raw_message, ensure_ascii=False, default=str)}"
             )
 
-        raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(inbound_raw_message)
+        platform_card_payloads: List[Dict[str, Any]] = []
+        raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(
+            inbound_raw_message,
+            platform_card_payloads=platform_card_payloads,
+        )
         if not raw_message:
             raise ValueError("消息内容为空或没有可转换的消息段")
 
@@ -1398,6 +1698,8 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             additional_config["platform_io_target_group_id"] = group_id
         else:
             additional_config["platform_io_target_user_id"] = user_id
+        if platform_card_payloads:
+            additional_config["platform_card_payloads"] = platform_card_payloads
 
         message_info: Dict[str, Any] = {
             "user_info": {
@@ -1519,7 +1821,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             resolved_names["nickname"] = nickname
         return resolved_names
 
-    async def _convert_inbound_segments(self, raw_message: Any) -> Tuple[List[Dict[str, Any]], str, bool, bool]:
+    async def _convert_inbound_segments(
+        self,
+        raw_message: Any,
+        *,
+        platform_card_payloads: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], str, bool, bool]:
         """转换 OneBot 消息段为 Host 消息段。"""
 
         if isinstance(raw_message, str):
@@ -1608,7 +1915,10 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 continue
 
             if item_type == "json":
-                json_text = self._build_inbound_json_card_text(item_data)
+                parsed_json = self._parse_inbound_json_card_payload(item_data)
+                if parsed_json is not None:
+                    self._append_platform_card_payload(platform_card_payloads, parsed_json)
+                json_text = self._build_inbound_json_card_text(item_data, parsed_json=parsed_json)
                 segments.append({"type": "text", "data": json_text})
                 plain_text_parts.append(json_text)
                 continue
@@ -1704,19 +2014,56 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             payload["file_id"] = file_id
         return payload
 
-    def _build_inbound_json_card_text(self, segment_data: Mapping[str, Any]) -> str:
-        """把 OneBot JSON 卡片转成可读文本摘要。"""
+    @staticmethod
+    def _parse_inbound_json_card_payload(segment_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """解析 OneBot JSON 卡片原始载荷。"""
 
         raw_json = str(segment_data.get("data") or "").strip()
         if not raw_json:
-            return "[json]"
+            return None
 
         try:
             parsed_json = json.loads(raw_json)
         except Exception:
-            return "[json]"
+            return None
 
         if not isinstance(parsed_json, Mapping):
+            return None
+        return dict(parsed_json)
+
+    @staticmethod
+    def _append_platform_card_payload(
+        platform_card_payloads: Optional[List[Dict[str, Any]]],
+        parsed_json: Mapping[str, Any],
+    ) -> None:
+        """保留平台卡片元数据，供下游插件识别小程序卡片。"""
+
+        if platform_card_payloads is None:
+            return
+
+        app_name = str(parsed_json.get("app") or "").strip()
+        if app_name != "com.tencent.miniapp_01":
+            return
+
+        platform_card_payloads.append(
+            {
+                "type": "miniapp_card",
+                "app": app_name,
+                "payload": dict(parsed_json),
+            }
+        )
+
+    def _build_inbound_json_card_text(
+        self,
+        segment_data: Mapping[str, Any],
+        *,
+        parsed_json: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """把 OneBot JSON 卡片转成可读文本摘要。"""
+
+        if parsed_json is None:
+            parsed_json = self._parse_inbound_json_card_payload(segment_data)
+        if parsed_json is None:
             return "[json]"
 
         prompt = str(parsed_json.get("prompt") or "").strip()
@@ -1762,9 +2109,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 or ""
             ).strip()
             url = str(
-                nested_value.get("url")
+                nested_value.get("qqdocurl")
+                or nested_value.get("url")
                 or nested_value.get("jumpUrl")
-                or nested_value.get("qqdocurl")
                 or nested_value.get("musicUrl")
                 or ""
             ).strip()
