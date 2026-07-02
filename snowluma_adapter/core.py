@@ -745,6 +745,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         try:
             action_name, params = self._build_outbound_action(message, route or {})
+            if self._load_settings().plugin.enable_ada_debug_raw_outbound_message_log:
+                self.ctx.logger.info(
+                    "SnowLuma 出站原始发送段（媒体已缩略）: "
+                    f"message_id={message.get('message_id')!r} "
+                    f"action={action_name!r} "
+                    f"params={self._dump_debug_payload(params)}"
+                )
             response = await self._call_action(action_name, params)
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -2830,7 +2837,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 continue
 
             if item_type == "image":
-                image_segment = self._build_media_segment("image", item, {"sub_type": 0})
+                image_segment = self._build_media_segment("image", item, {"subType": 0})
                 if image_segment:
                     segments.append(image_segment)
                 continue
@@ -2840,7 +2847,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                     "image",
                     item,
                     {
-                        "sub_type": 1,
+                        "subType": 1,
                         "summary": "[动画表情]",
                     },
                 )
@@ -2888,6 +2895,61 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             file_reference = f"file://{file_reference}"
         segment_data["file"] = file_reference
         return {"type": segment_type, "data": segment_data}
+
+    @classmethod
+    def _dump_debug_payload(cls, payload: Any) -> str:
+        """序列化调试载荷，并缩略日志中的大块媒体 Base64。"""
+
+        compacted_payload = cls._compact_debug_payload(payload)
+        return json.dumps(compacted_payload, ensure_ascii=False, default=str)
+
+    @classmethod
+    def _compact_debug_payload(cls, payload: Any, *, field_name: str = "") -> Any:
+        """递归缩略调试载荷中的媒体 Base64，避免日志被图片内容刷屏。"""
+
+        if isinstance(payload, Mapping):
+            return {
+                key: cls._compact_debug_payload(value, field_name=str(key))
+                for key, value in payload.items()
+            }
+
+        if isinstance(payload, list):
+            return [cls._compact_debug_payload(item, field_name=field_name) for item in payload]
+
+        if isinstance(payload, str):
+            return cls._compact_debug_string(payload, field_name=field_name)
+
+        return payload
+
+    @classmethod
+    def _compact_debug_string(cls, value: str, *, field_name: str = "") -> str:
+        """缩略单个字符串字段中的 Base64 内容。"""
+
+        normalized_value = value.strip()
+        if normalized_value.startswith("base64://"):
+            return "base64://" + cls._compact_base64_text(normalized_value.removeprefix("base64://"))
+
+        data_url_marker = ";base64,"
+        if normalized_value.startswith("data:") and data_url_marker in normalized_value:
+            prefix, raw_base64 = normalized_value.split(data_url_marker, maxsplit=1)
+            return f"{prefix}{data_url_marker}{cls._compact_base64_text(raw_base64)}"
+
+        media_field_names = {"base64", "binary_data_base64", "image_base64", "emoji_base64", "audio_base64"}
+        if field_name in media_field_names:
+            return cls._compact_base64_text(normalized_value)
+
+        return value
+
+    @staticmethod
+    def _compact_base64_text(raw_base64: str, *, head_length: int = 48, tail_length: int = 16) -> str:
+        """保留 Base64 头尾与长度，隐藏中间的大块内容。"""
+
+        if len(raw_base64) <= head_length + tail_length + 32:
+            return raw_base64
+
+        head = raw_base64[:head_length]
+        tail = raw_base64[-tail_length:]
+        return f"{head}...<base64省略 chars={len(raw_base64)}>...{tail}"
 
     @staticmethod
     def _normalize_outbound_reply_id(message_id: str) -> Optional[str]:

@@ -7,7 +7,7 @@ from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.4"
+SUPPORTED_CONFIG_VERSION = "1.0.5"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
 VOICE_TRANSCODE_SAMPLE_RATE = 24000
@@ -75,6 +75,27 @@ class SnowLumaPluginSection(PluginConfigBase):
             "order": 1,
         },
     )
+    enable_ada_debug_raw_outbound_message_log: bool = Field(
+        default=False,
+        description="是否启用 Ada 调试模式，记录 SnowLuma 出站原始发送段。",
+        json_schema_extra={
+            "label": "显示原始发送段",
+            "hint": "仅排查发送消息段结构问题时开启；开启后会记录每条出站消息实际调用 SnowLuma 的 action 和 params。",
+            "i18n": _schema_i18n(
+                label_en="Ada raw outbound debug",
+                label_ja="Ada 生送信デバッグ",
+                hint_en=(
+                    "Enable only while debugging outbound segment structure; logs the action and params "
+                    "actually sent to SnowLuma for each outbound message."
+                ),
+                hint_ja=(
+                    "送信セグメント構造を調査するときだけ有効にしてください。"
+                    "各送信メッセージで SnowLuma に実際に渡す action と params を記録します。"
+                ),
+            ),
+            "order": 2,
+        },
+    )
     enable_private_chat_tool: bool = Field(
         default=False,
         description="是否启用主动开启私聊工具。",
@@ -93,7 +114,7 @@ class SnowLumaPluginSection(PluginConfigBase):
                     "15 分間だけ個人チャットリストのフィルターを回避できます。"
                 ),
             ),
-            "order": 2,
+            "order": 3,
         },
     )
     qq_face_parse_mode: Literal["description", "emoji"] = Field(
@@ -114,7 +135,7 @@ class SnowLumaPluginSection(PluginConfigBase):
                     "emoji は近い Unicode 絵文字を優先します。"
                 ),
             ),
-            "order": 3,
+            "order": 4,
         },
     )
     config_version: str = Field(
