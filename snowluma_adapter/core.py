@@ -570,7 +570,6 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         "open_private_chat",
         description=(
             "向指定 QQ 用户发送一条私聊消息，用于主动开启私聊。"
-            "仅在 SnowLuma 配置 enable_private_chat_tool=true 时可用；"
             "发送成功后，该用户在 15 分钟内的私聊入站消息会绕过私聊黑白名单过滤。"
         ),
         parameters=[
@@ -3190,4 +3189,3 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         """保留给后续二进制媒体扩展使用。"""
 
         return hashlib.sha256(binary_data).hexdigest()
-
