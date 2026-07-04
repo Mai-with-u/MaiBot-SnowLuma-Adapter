@@ -1,10 +1,10 @@
 [project]
 name = "SnowLuma-Adapter"
-version = "0.1.0"
+version = "0.7.2"
 description = "MaiBot SnowLuma Adapter - 对接 SnowLuma 的适配器"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["aiohttp>=3.13.0", "tomlkit>=0.14.0", "maibot-plugin-sdk>=2.3.0"]
+dependencies = ["aiohttp>=3.13.0", "maibot-plugin-sdk>=2.3.0", "silk-python>=0.2.8"]
 
 [project.optional-dependencies]
 dev = ["ruff>=0.15.0"]
@@ -16,7 +16,7 @@ Issues = "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter/issues"
 
 [tool.ruff]
 
-include = ["*.py"]
+include = ["*.py", "snowluma_adapter/**/*.py"]
 
 # 行长度设置
 line-length = 120

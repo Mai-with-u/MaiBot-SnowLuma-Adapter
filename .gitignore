@@ -5,3 +5,5 @@ test/**
 config.toml
 config.toml.backup
 config.toml.backup.*
+config_back/
+config2.toml

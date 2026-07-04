@@ -1,0 +1,3193 @@
+from __future__ import annotations
+
+from importlib import import_module
+from io import BytesIO
+from pathlib import Path
+from shutil import which
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
+from uuid import uuid4
+
+from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
+from maibot_sdk import API, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
+
+import asyncio
+import base64
+import hashlib
+import json
+import time
+
+from .settings import (
+    PRIVATE_CHAT_TOOL_BYPASS_SECONDS,
+    SNOWLUMA_GATEWAY_NAME,
+    VOICE_TRANSCODE_SAMPLE_RATE,
+    VOICE_TRANSCODE_TIMEOUT_SECONDS,
+    SnowLumaAdapterSettings,
+)
+from ..qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
+
+OutboundAction = Tuple[str, Dict[str, Any]]
+
+
+class SnowLumaAdapterPlugin(MaiBotPlugin):
+    """SnowLuma 消息网关插件。"""
+
+    config_model: ClassVar[type[PluginConfigBase] | None] = SnowLumaAdapterSettings
+
+    def __init__(self) -> None:
+        """初始化 SnowLuma 适配器插件。"""
+
+        super().__init__()
+        self._session: Optional[ClientSession] = None
+        self._ws: Optional[ClientWebSocketResponse] = None
+        self._connection_task: Optional[asyncio.Task[None]] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._response_pool: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+        self._connected_account_id: str = ""
+        self._group_name_cache: Dict[str, str] = {}
+        self._group_member_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._private_chat_bypass_expires_at: Dict[str, float] = {}
+
+    async def on_load(self) -> None:
+        """插件加载后按配置启动连接。"""
+
+        await self._sync_private_chat_tool_component_state()
+        await self._restart_connection_if_needed()
+
+    async def on_unload(self) -> None:
+        """插件卸载前关闭连接。"""
+
+        await self._stop_connection()
+
+    async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
+        """配置更新后重启连接。"""
+
+        if scope != "self":
+            return
+
+        self.set_plugin_config(config_data)
+        if version:
+            self.ctx.logger.debug(f"SnowLuma 适配器收到配置更新: {version}")
+        await self._sync_private_chat_tool_component_state()
+        await self._restart_connection_if_needed()
+
+    @API("adapter.napcat.group.get_group_member_info", description="获取群成员信息", version="1", public=True)
+    async def api_get_group_member_info(
+        self,
+        group_id: Any,
+        user_id: Any,
+        no_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """获取群成员信息。"""
+
+        return await self._call_action(
+            "get_group_member_info",
+            {
+                "group_id": self._normalize_positive_id(group_id, "group_id"),
+                "user_id": self._normalize_positive_id(user_id, "user_id"),
+                "no_cache": bool(no_cache),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_ban", description="设置群成员禁言", version="1", public=True)
+    async def api_set_group_ban(self, group_id: Any, user_id: Any, duration: Any) -> Dict[str, Any]:
+        """设置群成员禁言。"""
+
+        normalized_duration = self._normalize_non_negative_int(duration, "duration")
+        if normalized_duration > 2592000:
+            raise ValueError("duration 不能超过 2592000 秒")
+        return await self._call_action(
+            "set_group_ban",
+            {
+                "group_id": self._normalize_positive_id(group_id, "group_id"),
+                "user_id": self._normalize_positive_id(user_id, "user_id"),
+                "duration": normalized_duration,
+            },
+        )
+
+    # ================================================================
+    # 发送 / 撤回 / 登录信息 公开 API
+    # 供 ai_draw_plugin 等插件通过 SDK passthrough 调用，避免插件直连 NapCat。
+    # 走 WebSocket 长连接（_call_action），回传 message_id 以支持精确撤回。
+    # ================================================================
+
+    def _action_result(self, response: Mapping[str, Any]) -> Dict[str, Any]:
+        """统一封装动作响应：附带 message_id，保留原始 data/retcode。"""
+
+        return {
+            "status": str(response.get("status") or ""),
+            "retcode": response.get("retcode"),
+            "message_id": self._extract_action_message_id(response),
+            "data": response.get("data"),
+        }
+
+    @staticmethod
+    def _api_params(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+        """兼容直接传参和 NapCat 风格 ``params`` 包装。"""
+
+        raw_params = kwargs.get("params", kwargs)
+        if raw_params is None:
+            return {}
+        if not isinstance(raw_params, Mapping):
+            raise ValueError("params 必须是字典")
+        return dict(raw_params)
+
+    async def _call_passthrough_action(self, action: str, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+        """透传调用 SnowLuma OneBot action。"""
+
+        return await self._call_action(action, self._api_params(kwargs))
+
+    @API("adapter.napcat.account.get_friend_list", description="获取好友列表", version="1", public=True)
+    async def api_get_friend_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取好友列表。"""
+
+        del kwargs
+        return await self._call_action("get_friend_list", {})
+
+    @API("adapter.napcat.account.get_cookies", description="获取 Cookies", version="1", public=True)
+    async def api_get_cookies(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 Cookies。"""
+
+        return await self._call_passthrough_action("get_cookies", kwargs)
+
+    @API("adapter.napcat.account.get_stranger_info", description="获取陌生人信息", version="1", public=True)
+    async def api_get_stranger_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取陌生人信息。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_stranger_info",
+            {"user_id": self._normalize_positive_id(params.get("user_id"), "user_id")},
+        )
+
+    @API("adapter.napcat.account.get_profile_like", description="获取资料点赞", version="1", public=True)
+    async def api_get_profile_like(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取资料点赞。"""
+
+        return await self._call_passthrough_action("get_profile_like", kwargs)
+
+    @API("adapter.napcat.account.ocr_image", description="图片 OCR 识别", version="1", public=True)
+    async def api_ocr_image(self, **kwargs: Any) -> Dict[str, Any]:
+        """图片 OCR 识别。"""
+
+        return await self._call_passthrough_action("ocr_image", kwargs)
+
+    @API("adapter.napcat.account.send_like", description="点赞", version="1", public=True)
+    async def api_send_like(self, **kwargs: Any) -> Dict[str, Any]:
+        """给指定用户点赞。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "send_like",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "times": int(params.get("times", 1)),
+            },
+        )
+
+    @API("adapter.napcat.account.set_qq_profile", description="设置 QQ 账号资料", version="1", public=True)
+    async def api_set_qq_profile(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置 QQ 账号资料。"""
+
+        params = self._api_params(kwargs)
+        action_params: Dict[str, Any] = {}
+        if "nickname" in params:
+            action_params["nickname"] = str(params.get("nickname") or "")
+        if "personal_note" in params:
+            action_params["personal_note"] = str(params.get("personal_note") or "")
+        return await self._call_action("set_qq_profile", action_params)
+
+    @API("adapter.napcat.account.set_qq_avatar", description="设置 QQ 头像", version="1", public=True)
+    async def api_set_qq_avatar(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置 QQ 头像。"""
+
+        return await self._call_passthrough_action("set_qq_avatar", kwargs)
+
+    @API("adapter.napcat.account.set_self_longnick", description="设置个性签名", version="1", public=True)
+    async def api_set_self_longnick(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置个性签名。"""
+
+        return await self._call_passthrough_action("set_self_longnick", kwargs)
+
+    @API("adapter.napcat.account.set_diy_online_status", description="设置自定义在线状态", version="1", public=True)
+    async def api_set_diy_online_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置自定义在线状态。"""
+
+        return await self._call_passthrough_action("set_diy_online_status", kwargs)
+
+    @API("adapter.napcat.group.get_group_list", description="获取群列表", version="1", public=True)
+    async def api_get_group_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群列表。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action("get_group_list", {"no_cache": bool(params.get("no_cache", False))})
+
+    @API("adapter.napcat.group.get_group_info", description="获取群信息", version="1", public=True)
+    async def api_get_group_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群信息。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_info",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "no_cache": bool(params.get("no_cache", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.get_group_member_list", description="获取群成员列表", version="1", public=True)
+    async def api_get_group_member_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群成员列表。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_member_list",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "no_cache": bool(params.get("no_cache", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_kick", description="踢出单个群成员", version="1", public=True)
+    async def api_set_group_kick(self, **kwargs: Any) -> Dict[str, Any]:
+        """踢出单个群成员。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "set_group_kick",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "reject_add_request": bool(params.get("reject_add_request", False)),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_card", description="设置群名片", version="1", public=True)
+    async def api_set_group_card(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置群名片。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "set_group_card",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "card": str(params.get("card") or ""),
+            },
+        )
+
+    @API("adapter.napcat.group.set_group_name", description="设置群名称", version="1", public=True)
+    async def api_set_group_name(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置群名称。"""
+
+        params = self._api_params(kwargs)
+        group_name = str(params.get("group_name") or "").strip()
+        if not group_name:
+            raise ValueError("group_name 不能为空")
+        return await self._call_action(
+            "set_group_name",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "group_name": group_name,
+            },
+        )
+
+    @API("adapter.napcat.file.get_record", description="获取语音文件详情", version="1", public=True)
+    async def api_get_record(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取语音文件详情。"""
+
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or params.get("file_id") or "").strip()
+        if not file_ref:
+            raise ValueError("file 或 file_id 至少提供一个")
+        return await self._call_action("get_record", {"file": file_ref})
+
+    @API("adapter.napcat.file.get_group_file_url", description="获取群文件 URL", version="1", public=True)
+    async def api_get_group_file_url(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群文件下载链接。"""
+
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_file_url",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "file_id": str(params.get("file_id") or "").strip(),
+                "busid": int(params.get("busid", 102)),
+            },
+        )
+
+    @API("adapter.napcat.file.upload_group_file", description="上传群文件", version="1", public=True)
+    async def api_upload_group_file(self, **kwargs: Any) -> Dict[str, Any]:
+        """上传群文件。"""
+
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or "").strip()
+        if not file_ref:
+            raise ValueError("file 不能为空")
+        return await self._call_action(
+            "upload_group_file",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "file": file_ref,
+                "name": str(params.get("name") or ""),
+                "folder": str(params.get("folder") or ""),
+                "folder_id": str(params.get("folder_id") or ""),
+                "upload_file": bool(params.get("upload_file", True)),
+            },
+        )
+
+    @API("adapter.napcat.file.upload_private_file", description="上传私聊文件", version="1", public=True)
+    async def api_upload_private_file(self, **kwargs: Any) -> Dict[str, Any]:
+        """上传私聊文件。"""
+
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or "").strip()
+        if not file_ref:
+            raise ValueError("file 不能为空")
+        return await self._call_action(
+            "upload_private_file",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "file": file_ref,
+                "name": str(params.get("name") or ""),
+                "upload_file": bool(params.get("upload_file", True)),
+            },
+        )
+
+    @API("adapter.napcat.message.send_group_msg", description="发送群消息", version="1", public=True)
+    async def api_send_group_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送群消息（OneBot message 段数组）。"""
+        params = self._api_params(kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action(
+            "send_group_msg",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "message": message,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_private_msg", description="发送私聊消息", version="1", public=True)
+    async def api_send_private_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送私聊消息（OneBot message 段数组）。"""
+        params = self._api_params(kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action(
+            "send_private_msg",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "message": message,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_group_forward_msg", description="发送群合并转发消息", version="1", public=True)
+    async def api_send_group_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送群合并转发消息（OneBot node 段数组）。"""
+        params = self._api_params(kwargs)
+        messages = params.get("messages") or params.get("message")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages 必须是非空的转发节点数组")
+        response = await self._call_action(
+            "send_group_forward_msg",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "messages": messages,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_private_forward_msg", description="发送私聊合并转发消息", version="1", public=True)
+    async def api_send_private_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送私聊合并转发消息（OneBot node 段数组）。"""
+        params = self._api_params(kwargs)
+        messages = params.get("messages") or params.get("message")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages 必须是非空的转发节点数组")
+        response = await self._call_action(
+            "send_private_forward_msg",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "messages": messages,
+            },
+        )
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.delete_msg", description="撤回消息", version="1", public=True)
+    async def api_delete_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """撤回消息。message_id 允许为负（OneBot 32 位有符号回绕值）。"""
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "delete_msg",
+            {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
+        )
+
+    @API("adapter.napcat.message.get_group_msg_history", description="获取群消息历史", version="1", public=True)
+    async def api_get_group_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取群消息历史。"""
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_group_msg_history",
+            {
+                "group_id": self._normalize_positive_id(params.get("group_id"), "group_id"),
+                "count": int(params.get("count", 20)),
+            },
+        )
+
+    @API("adapter.napcat.message.get_friend_msg_history", description="获取私聊消息历史", version="1", public=True)
+    async def api_get_friend_msg_history(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取私聊消息历史。"""
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_friend_msg_history",
+            {
+                "user_id": self._normalize_positive_id(params.get("user_id"), "user_id"),
+                "count": int(params.get("count", 20)),
+            },
+        )
+
+    @API("adapter.napcat.system.get_login_info", description="获取当前登录账号信息", version="1", public=True)
+    async def api_get_login_info(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 bot 自身 QQ 号与昵称（合并转发节点需要真实 uin）。"""
+        del kwargs
+        return await self._call_action("get_login_info", {})
+
+    @API("adapter.napcat.message.get_msg", description="按消息 ID 获取消息", version="1", public=True)
+    async def api_get_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 message_id 实时取回消息（含图片段，URL 由本体刷新有效 rkey）。
+
+        供下游插件追溯被引用消息取图，不依赖任何本地消息库缓存。
+        message_id 允许为负（OneBot 32 位有符号回绕值）。
+        """
+        params = self._api_params(kwargs)
+        return await self._call_action(
+            "get_msg",
+            {"message_id": self._normalize_int(params.get("message_id"), "message_id")},
+        )
+
+    @API("adapter.napcat.message.get_forward_msg", description="获取合并转发消息", version="1", public=True)
+    async def api_get_forward_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取合并转发消息详情。"""
+
+        params = self._api_params(kwargs)
+        forward_id = str(params.get("id") or params.get("message_id") or "").strip()
+        if not forward_id:
+            raise ValueError("message_id 或 id 至少提供一个")
+        return await self._call_action("get_forward_msg", {"id": forward_id})
+
+    @API("adapter.napcat.message.send_msg", description="发送消息", version="1", public=True)
+    async def api_send_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 message_type/group_id 自动发送群聊或私聊消息。"""
+
+        params = self._api_params(kwargs)
+        message = params.get("message")
+        if not isinstance(message, list) or not message:
+            raise ValueError("message 必须是非空的消息段数组")
+        response = await self._call_action("send_msg", params)
+        return self._action_result(response)
+
+    @API("adapter.napcat.message.send_poke", description="发送戳一戳", version="1", public=True)
+    async def api_send_poke(self, **kwargs: Any) -> Dict[str, Any]:
+        """发送戳一戳。"""
+
+        params = self._api_params(kwargs)
+        raw_user_id = params.get("user_id") or params.get("qq_id") or params.get("target_id")
+        action_params: Dict[str, Any] = {"user_id": self._normalize_positive_id(raw_user_id, "user_id")}
+        raw_group_id = params.get("group_id")
+        if raw_group_id is not None and str(raw_group_id).strip():
+            action_params["group_id"] = self._normalize_positive_id(raw_group_id, "group_id")
+        return await self._call_action("send_poke", action_params)
+
+    @API("adapter.napcat.file.get_image", description="按文件引用获取图片信息", version="1", public=True)
+    async def api_get_image(self, **kwargs: Any) -> Dict[str, Any]:
+        """按 file/file_id 解析图片信息（含可下载 URL）。"""
+        params = self._api_params(kwargs)
+        file_ref = str(params.get("file") or params.get("file_id") or "").strip()
+        if not file_ref:
+            raise ValueError("file 不能为空")
+        return await self._call_action("get_image", {"file": file_ref})
+
+    @API("adapter.napcat.qzone.get_qzone_msg_list", description="获取 QQ 空间说说列表", version="1", public=True)
+    async def api_get_qzone_msg_list(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 QQ 空间说说列表。"""
+
+        return await self._call_passthrough_action("get_qzone_msg_list", kwargs)
+
+    @API("adapter.napcat.qzone.get_qzone_feeds", description="获取 QQ 空间好友动态", version="1", public=True)
+    async def api_get_qzone_feeds(self, **kwargs: Any) -> Dict[str, Any]:
+        """获取 QQ 空间好友动态。"""
+
+        return await self._call_passthrough_action("get_qzone_feeds", kwargs)
+
+    @API("adapter.napcat.qzone.send_qzone_msg", description="发表 QQ 空间说说", version="1", public=True)
+    async def api_send_qzone_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """发表 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("send_qzone_msg", kwargs)
+
+    @API("adapter.napcat.qzone.delete_qzone_msg", description="删除 QQ 空间说说", version="1", public=True)
+    async def api_delete_qzone_msg(self, **kwargs: Any) -> Dict[str, Any]:
+        """删除 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("delete_qzone_msg", kwargs)
+
+    @API("adapter.napcat.qzone.like_qzone", description="点赞 QQ 空间说说", version="1", public=True)
+    async def api_like_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """点赞 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("like_qzone", kwargs)
+
+    @API("adapter.napcat.qzone.unlike_qzone", description="取消点赞 QQ 空间说说", version="1", public=True)
+    async def api_unlike_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """取消点赞 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("unlike_qzone", kwargs)
+
+    @API("adapter.napcat.qzone.comment_qzone", description="评论 QQ 空间说说", version="1", public=True)
+    async def api_comment_qzone(self, **kwargs: Any) -> Dict[str, Any]:
+        """评论 QQ 空间说说。"""
+
+        return await self._call_passthrough_action("comment_qzone", kwargs)
+
+    @API("adapter.napcat.system.set_input_status", description="设置输入状态", version="1", public=True)
+    async def api_set_input_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置输入状态。"""
+
+        return await self._call_passthrough_action("set_input_status", kwargs)
+
+    @API("adapter.napcat.system.set_online_status", description="设置在线状态", version="1", public=True)
+    async def api_set_online_status(self, **kwargs: Any) -> Dict[str, Any]:
+        """设置在线状态。"""
+
+        return await self._call_passthrough_action("set_online_status", kwargs)
+
+    @Tool(
+        "open_private_chat",
+        description=(
+            "向指定 QQ 用户发送一条私聊消息，用于主动开启私聊。"
+            "仅在 SnowLuma 配置 enable_private_chat_tool=true 时可用；"
+            "发送成功后，该用户在 15 分钟内的私聊入站消息会绕过私聊黑白名单过滤。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="user_id",
+                param_type=ToolParamType.STRING,
+                description="要开启私聊的 QQ 用户 ID，必须是正整数。",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="message",
+                param_type=ToolParamType.STRING,
+                description="要发送给该用户的第一条私聊消息。",
+                required=True,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_open_private_chat(
+        self,
+        user_id: Any = "",
+        message: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """主动向指定用户发送私聊消息，并临时放行该私聊。"""
+
+        del kwargs
+
+        settings = self._load_settings()
+
+        if self._ws is None:
+            return {"success": False, "error": "SnowLuma WebSocket 尚未连接"}
+
+        try:
+            normalized_user_id_int = self._normalize_positive_id(user_id, "user_id")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        normalized_user_id = str(normalized_user_id_int)
+
+        normalized_message = str(message or "").strip()
+        if not normalized_message:
+            return {"success": False, "error": "私聊消息不能为空"}
+
+        open_session_result = await self.ctx.chat.open_session(
+            platform="qq",
+            chat_type="private",
+            user_id=normalized_user_id,
+            account_id=self._connected_account_id,
+            scope=settings.luma_client.connection_id,
+        )
+        if not isinstance(open_session_result, Mapping) or not bool(open_session_result.get("success", False)):
+            error = ""
+            if isinstance(open_session_result, Mapping):
+                error = str(open_session_result.get("error") or "").strip()
+            return {
+                "success": False,
+                "error": error or "打开私聊会话失败",
+                "open_session_result": open_session_result,
+            }
+
+        response = await self._call_action(
+            "send_msg",
+            {
+                "message_type": "private",
+                "user_id": normalized_user_id_int,
+                "message": [{"type": "text", "data": {"text": normalized_message}}],
+            },
+        )
+        send_error = self._extract_action_error(response)
+        if send_error:
+            return {
+                "success": False,
+                "error": send_error,
+                "response": response,
+            }
+
+        expires_at = self._grant_private_chat_bypass(normalized_user_id)
+        message_id = self._extract_action_message_id(response)
+        self.ctx.logger.info(
+            f"SnowLuma 已主动开启私聊: user_id={normalized_user_id} "
+            f"message_id={message_id or '<unknown>'} bypass_seconds={PRIVATE_CHAT_TOOL_BYPASS_SECONDS}"
+        )
+        return {
+            "success": True,
+            "content": (
+                f"已向用户 {normalized_user_id} 发送私聊消息，"
+                f"并在 {PRIVATE_CHAT_TOOL_BYPASS_SECONDS // 60} 分钟内临时放行该私聊。"
+            ),
+            "user_id": normalized_user_id,
+            "stream_id": str(open_session_result.get("session_id") or open_session_result.get("stream_id") or ""),
+            "session": open_session_result.get("stream") or {},
+            "message_id": message_id,
+            "expires_at": expires_at,
+            "bypass_seconds": PRIVATE_CHAT_TOOL_BYPASS_SECONDS,
+        }
+
+    @Tool(
+        "get_qq_by_msg_id",
+        description=(
+            "根据当前聊天中的消息 ID 获取该消息发送者的 QQ 用户 ID。"
+            "当只知道昵称或需要调用 open_private_chat 但缺少 user_id 时，先调用此工具。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="msg_id",
+                param_type=ToolParamType.STRING,
+                description="目标用户发送的消息 ID。",
+                required=True,
+            ),
+        ],
+        enabled=False,
+        visibility="visible",
+    )
+    async def tool_get_qq_by_msg_id(
+        self,
+        msg_id: str = "",
+        stream_id: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """根据消息 ID 查询该消息发送者的 QQ 号。"""
+
+        del kwargs
+
+        normalized_msg_id = str(msg_id or "").strip()
+        if not normalized_msg_id:
+            return {"success": False, "error": "缺少目标消息 ID"}
+
+        target_stream_id = str(stream_id or chat_id or "").strip()
+        query_result = await self.ctx.message.get_by_id(
+            normalized_msg_id,
+            stream_id=target_stream_id,
+            include_binary_data=False,
+        )
+        if not isinstance(query_result, Mapping):
+            return {
+                "success": False,
+                "error": f"未找到消息: {normalized_msg_id}",
+                "msg_id": normalized_msg_id,
+            }
+
+        user_info = self._extract_message_user_info(query_result)
+        user_id = str(user_info.get("user_id") or "").strip()
+        if not user_id:
+            return {
+                "success": False,
+                "error": f"消息 {normalized_msg_id} 缺少发送者 QQ 号",
+                "msg_id": normalized_msg_id,
+            }
+
+        user_nickname = str(user_info.get("user_nickname") or "").strip()
+        user_cardname = str(user_info.get("user_cardname") or "").strip()
+        display_name = user_cardname or user_nickname or user_id
+        message_info = query_result.get("message_info", {})
+        if not isinstance(message_info, Mapping):
+            message_info = {}
+        group_info = message_info.get("group_info", {})
+        if not isinstance(group_info, Mapping):
+            group_info = {}
+
+        return {
+            "success": True,
+            "content": f"消息 {normalized_msg_id} 的发送者是 {display_name}，QQ 号为 {user_id}。",
+            "msg_id": normalized_msg_id,
+            "user_id": user_id,
+            "qq": user_id,
+            "user_nickname": user_nickname,
+            "user_cardname": user_cardname,
+            "display_name": display_name,
+            "platform": str(query_result.get("platform") or "").strip(),
+            "session_id": str(query_result.get("session_id") or target_stream_id or "").strip(),
+            "group_id": str(group_info.get("group_id") or "").strip(),
+            "group_name": str(group_info.get("group_name") or "").strip(),
+        }
+
+    @MessageGateway(
+        name=SNOWLUMA_GATEWAY_NAME,
+        route_type="duplex",
+        platform="qq",
+        protocol="snowluma",
+        description="SnowLuma WebSocket 双工消息网关",
+    )
+    async def handle_snowluma_gateway(
+        self,
+        message: Dict[str, Any],
+        route: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """处理 Host 出站消息并发送到 SnowLuma。"""
+
+        del metadata
+        del kwargs
+
+        if self._ws is None:
+            return {"success": False, "error": "SnowLuma WebSocket 尚未连接"}
+
+        try:
+            actions = self._build_outbound_actions(message, route or {})
+            responses: List[Tuple[str, Mapping[str, Any]]] = []
+            for action_name, params in actions:
+                if self._load_settings().plugin.enable_ada_debug_raw_outbound_message_log:
+                    self.ctx.logger.info(
+                        "SnowLuma 出站原始发送段（媒体已缩略）: "
+                        f"message_id={message.get('message_id')!r} "
+                        f"action={action_name!r} "
+                        f"params={self._dump_debug_payload(params)}"
+                    )
+                response = await self._call_action(action_name, params)
+                if not isinstance(response, Mapping):
+                    return {"success": False, "error": "SnowLuma 返回了无效响应"}
+
+                status = str(response.get("status") or "").lower()
+                retcode = response.get("retcode")
+                if status and status != "ok":
+                    return {
+                        "success": False,
+                        "error": str(response.get("wording") or response.get("message") or "SnowLuma send failed"),
+                        "metadata": {"action": action_name, "retcode": retcode},
+                    }
+                if isinstance(retcode, int) and retcode not in {0, 1}:
+                    return {
+                        "success": False,
+                        "error": str(response.get("wording") or response.get("message") or "SnowLuma send failed"),
+                        "metadata": {"action": action_name, "retcode": retcode},
+                    }
+                responses.append((action_name, response))
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        internal_message_id = str(message.get("message_id") or "").strip()
+        external_message_id = ""
+        for _, response in responses:
+            response_data = response.get("data", {})
+            if not isinstance(response_data, Mapping):
+                continue
+            external_message_id = str(response_data.get("message_id") or "")
+            if external_message_id:
+                break
+
+        adapter_callbacks = []
+        if internal_message_id and external_message_id and internal_message_id != external_message_id:
+            adapter_callbacks.append(
+                {
+                    "name": "message_id_echo",
+                    "payload": {
+                        "content": {
+                            "type": "echo",
+                            "echo": internal_message_id,
+                            "actual_id": external_message_id,
+                        }
+                    },
+                }
+            )
+
+        return {
+            "success": True,
+            "external_message_id": external_message_id or None,
+            "metadata": {
+                "action": responses[0][0] if len(responses) == 1 else "multiple",
+                "actions": [action_name for action_name, _ in responses],
+                "adapter_callbacks": adapter_callbacks,
+            },
+        }
+
+    def _load_settings(self) -> SnowLumaAdapterSettings:
+        """返回当前强类型配置。"""
+
+        return self.config  # type: ignore[return-value]
+
+    async def _sync_private_chat_tool_component_state(self) -> None:
+        """按配置同步主动私聊工具组件的启停状态。"""
+
+        enabled = bool(self._load_settings().plugin.enable_private_chat_tool)
+        tool_names = ("open_private_chat", "get_qq_by_msg_id")
+        try:
+            for tool_name in tool_names:
+                if enabled:
+                    result = await self.ctx.component.enable_component(tool_name, "TOOL")
+                else:
+                    result = await self.ctx.component.disable_component(tool_name, "TOOL")
+                if isinstance(result, Mapping) and not bool(result.get("success", False)):
+                    self.ctx.logger.warning(
+                        f"SnowLuma 同步主动私聊工具启停状态失败: tool={tool_name} "
+                        f"error={result.get('error') or result}"
+                    )
+        except Exception as exc:
+            self.ctx.logger.warning(f"SnowLuma 同步主动私聊工具启停状态失败: {exc}")
+
+    async def _restart_connection_if_needed(self) -> None:
+        """根据当前配置重启连接循环。"""
+
+        await self._stop_connection()
+        settings = self._load_settings()
+        if not settings.should_connect():
+            self.ctx.logger.info("SnowLuma 适配器保持空闲状态，因为插件未启用")
+            return
+
+        self._stop_event = asyncio.Event()
+        self._connection_task = asyncio.create_task(self._run_connection_loop(), name="snowluma-adapter-loop")
+
+    async def _stop_connection(self) -> None:
+        """停止连接循环并清理资源。"""
+
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+        task = self._connection_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._connection_task = None
+
+        await self._disconnect()
+        await self._report_gateway_ready(False)
+
+    async def _run_connection_loop(self) -> None:
+        """维持到 SnowLuma 的 WebSocket 连接。"""
+
+        while self._stop_event is not None and not self._stop_event.is_set():
+            settings = self._load_settings()
+            try:
+                await self._connect(settings)
+                await self._bootstrap_runtime_state(settings)
+                await self._listen()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ctx.logger.warning(f"SnowLuma 连接异常，稍后重试: {exc}")
+            finally:
+                await self._disconnect()
+                await self._report_gateway_ready(False)
+
+            if self._stop_event is None or self._stop_event.is_set():
+                break
+            await asyncio.sleep(max(1.0, settings.luma_client.reconnect_delay_sec))
+
+    async def _connect(self, settings: SnowLumaAdapterSettings) -> None:
+        """建立 WebSocket 连接。"""
+
+        timeout = ClientTimeout(total=10)
+        self._session = ClientSession(timeout=timeout)
+        self._ws = await self._session.ws_connect(settings.luma_client.build_ws_url())
+        self.ctx.logger.info(f"SnowLuma WebSocket 已连接: {settings.luma_client.build_ws_url()}")
+
+    async def _disconnect(self) -> None:
+        """关闭 WebSocket 和未完成动作。"""
+
+        if self._ws is not None:
+            await self._ws.close()
+            self._ws = None
+
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+        for future in self._response_pool.values():
+            if not future.done():
+                future.cancel()
+        self._response_pool.clear()
+        self._connected_account_id = ""
+
+    async def _bootstrap_runtime_state(self, settings: SnowLumaAdapterSettings) -> None:
+        """连接建立后激活消息网关路由。"""
+
+        await self._report_gateway_ready(True, settings=settings)
+
+    async def _report_gateway_ready(
+        self,
+        ready: bool,
+        *,
+        account_id: str = "",
+        settings: Optional[SnowLumaAdapterSettings] = None,
+    ) -> bool:
+        """向 Host 上报消息网关运行状态。"""
+
+        metadata: Dict[str, Any] = {}
+        scope = ""
+        if settings is not None:
+            metadata["ws_url"] = settings.luma_client.build_ws_url()
+            scope = settings.luma_client.connection_id
+
+        try:
+            return await self.ctx.gateway.update_state(
+                gateway_name=SNOWLUMA_GATEWAY_NAME,
+                ready=ready,
+                platform="qq",
+                account_id=account_id,
+                scope=scope,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(f"SnowLuma 消息网关状态上报失败: {exc}")
+            return False
+
+    async def _listen(self) -> None:
+        """监听 SnowLuma 推送。"""
+
+        if self._ws is None:
+            return
+
+        async for ws_message in self._ws:
+            if ws_message.type == WSMsgType.TEXT:
+                await self._handle_text_payload(ws_message.data)
+                continue
+            if ws_message.type == WSMsgType.BINARY:
+                self.ctx.logger.debug("SnowLuma 收到二进制消息，已忽略")
+                continue
+            if ws_message.type in {WSMsgType.CLOSED, WSMsgType.ERROR}:
+                break
+
+    async def _handle_text_payload(self, raw_payload: str) -> None:
+        """处理 SnowLuma 文本载荷。"""
+
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            self.ctx.logger.warning(f"SnowLuma 收到非 JSON 文本: {raw_payload[:120]}")
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        echo = str(payload.get("echo") or "").strip()
+        if echo:
+            self._resolve_echo_response(echo, payload)
+            return
+
+        post_type = str(payload.get("post_type") or "").strip()
+        if self_id := str(payload.get("self_id") or "").strip():
+            await self._update_connected_account(self_id)
+        if post_type == "message" or "message" in payload:
+            asyncio.create_task(self._route_inbound_message(payload), name="snowluma-route-message")
+            return
+        if post_type == "notice":
+            asyncio.create_task(self._route_inbound_notice(payload), name="snowluma-route-notice")
+
+    async def _update_connected_account(self, account_id: str) -> None:
+        """从 SnowLuma 推送中更新当前账号 ID。"""
+
+        if not account_id or account_id == self._connected_account_id:
+            return
+        self._connected_account_id = account_id
+        await self._report_gateway_ready(True, account_id=account_id, settings=self._load_settings())
+
+    def _resolve_echo_response(self, echo: str, payload: Dict[str, Any]) -> None:
+        """回填动作调用响应。"""
+
+        future = self._response_pool.pop(echo, None)
+        if future is not None and not future.done():
+            future.set_result(payload)
+
+    async def _call_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """调用 SnowLuma OneBot 风格动作接口。"""
+
+        if self._ws is None:
+            raise RuntimeError("SnowLuma WebSocket 尚未连接")
+
+        settings = self._load_settings()
+        echo = uuid4().hex
+        future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._response_pool[echo] = future
+
+        payload = {"action": action, "params": params, "echo": echo}
+        await self._ws.send_str(json.dumps(payload, ensure_ascii=False))
+        try:
+            return await asyncio.wait_for(future, timeout=max(1.0, settings.luma_client.action_timeout_sec))
+        except asyncio.TimeoutError as exc:
+            timeout_seconds = max(1.0, settings.luma_client.action_timeout_sec)
+            self.ctx.logger.warning(
+                "SnowLuma action 等待响应超时，准备断开旧连接并触发重连: action=%s timeout=%.1fs",
+                action,
+                timeout_seconds,
+            )
+            await self._report_gateway_ready(False, settings=settings)
+            await self._disconnect()
+            raise TimeoutError(f"SnowLuma action {action} 响应超时（{timeout_seconds:.1f}s）") from exc
+        finally:
+            self._response_pool.pop(echo, None)
+
+    @staticmethod
+    def _extract_action_error(response: Mapping[str, Any]) -> str:
+        """从 SnowLuma 动作响应中提取错误信息；空字符串表示成功。"""
+
+        status = str(response.get("status") or "").strip().lower()
+        retcode = response.get("retcode")
+        if status and status != "ok":
+            return str(response.get("wording") or response.get("message") or "SnowLuma send failed")
+        if isinstance(retcode, int) and retcode not in {0, 1}:
+            return str(response.get("wording") or response.get("message") or "SnowLuma send failed")
+        return ""
+
+    @staticmethod
+    def _extract_action_message_id(response: Mapping[str, Any]) -> str:
+        """从 SnowLuma 动作响应中提取平台消息 ID。"""
+
+        response_data = response.get("data", {})
+        if not isinstance(response_data, Mapping):
+            return ""
+        return str(response_data.get("message_id") or "").strip()
+
+    @staticmethod
+    def _extract_message_user_info(message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """从序列化消息中提取发送者信息。"""
+
+        message_info = message.get("message_info", {})
+        if not isinstance(message_info, Mapping):
+            return {}
+        user_info = message_info.get("user_info", {})
+        if not isinstance(user_info, Mapping):
+            return {}
+        return user_info
+
+    def _grant_private_chat_bypass(self, user_id: str) -> float:
+        """授予指定用户临时私聊名单放行窗口。"""
+
+        self._purge_expired_private_chat_bypasses()
+        expires_at = time.time() + PRIVATE_CHAT_TOOL_BYPASS_SECONDS
+        self._private_chat_bypass_expires_at[user_id] = expires_at
+        return expires_at
+
+    def _get_private_chat_bypass_remaining_seconds(self, user_id: str) -> float:
+        """获取指定用户临时私聊放行窗口的剩余秒数。"""
+
+        self._purge_expired_private_chat_bypasses()
+        expires_at = self._private_chat_bypass_expires_at.get(user_id, 0.0)
+        return max(0.0, expires_at - time.time())
+
+    def _has_active_private_chat_bypass(self, user_id: str) -> bool:
+        """判断指定用户是否处于临时私聊名单放行窗口内。"""
+
+        return self._get_private_chat_bypass_remaining_seconds(user_id) > 0
+
+    def _purge_expired_private_chat_bypasses(self) -> None:
+        """清理已过期的临时私聊名单放行记录。"""
+
+        now = time.time()
+        expired_user_ids = [
+            user_id for user_id, expires_at in self._private_chat_bypass_expires_at.items() if expires_at <= now
+        ]
+        for user_id in expired_user_ids:
+            self._private_chat_bypass_expires_at.pop(user_id, None)
+
+    @staticmethod
+    def _normalize_positive_id(value: Any, field_name: str) -> int:
+        """规范化 QQ 号、群号等正整数标识。"""
+
+        try:
+            normalized_value = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是正整数") from exc
+        if normalized_value <= 0:
+            raise ValueError(f"{field_name} 必须是正整数")
+        return normalized_value
+
+    @staticmethod
+    def _normalize_non_negative_int(value: Any, field_name: str) -> int:
+        """规范化非负整数参数。"""
+
+        try:
+            normalized_value = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是非负整数") from exc
+        if normalized_value < 0:
+            raise ValueError(f"{field_name} 必须是非负整数")
+        return normalized_value
+
+    @staticmethod
+    def _normalize_int(value: Any, field_name: str) -> int:
+        """规范化任意整数（允许负数）。message_id 等可能是 32 位有符号回绕值。"""
+
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
+
+    @staticmethod
+    def _normalize_inbound_reply_id(value: Any) -> str:
+        """规范化入站引用消息 ID，过滤 SnowLuma/OneBot 的空引用。"""
+
+        normalized_value = str(value or "").strip()
+        if not normalized_value:
+            return ""
+        try:
+            reply_id = int(normalized_value)
+        except ValueError:
+            return normalized_value
+        if reply_id == 0:
+            return ""
+        return str(reply_id)
+
+    @staticmethod
+    def _extract_reply_target_id(raw_message: List[Dict[str, Any]]) -> str:
+        """从标准消息段中提取首个引用目标 ID。"""
+
+        for segment in raw_message:
+            if not isinstance(segment, dict) or segment.get("type") != "reply":
+                continue
+            data = segment.get("data")
+            if isinstance(data, Mapping):
+                target_message_id = str(data.get("target_message_id") or "").strip()
+            else:
+                target_message_id = str(data or "").strip()
+            if target_message_id:
+                return target_message_id
+        return ""
+
+    async def _route_inbound_message(self, payload: Dict[str, Any]) -> None:
+        """将 SnowLuma 入站消息转换为 Host 标准消息并注入。"""
+
+        if not self._is_inbound_message_allowed(payload):
+            return
+
+        try:
+            message_dict = await self._build_inbound_message_dict(payload)
+        except ValueError as exc:
+            self.ctx.logger.warning(f"SnowLuma 入站消息格式不受支持，已丢弃: {exc}")
+            return
+
+        external_message_id = str(payload.get("message_id") or "").strip()
+        route_metadata: Dict[str, Any] = {}
+        if self._connected_account_id:
+            route_metadata["self_id"] = self._connected_account_id
+        if connection_id := self._load_settings().luma_client.connection_id:
+            route_metadata["connection_id"] = connection_id
+
+        accepted = await self.ctx.gateway.route_message(
+            gateway_name=SNOWLUMA_GATEWAY_NAME,
+            message=message_dict,
+            route_metadata=route_metadata,
+            external_message_id=external_message_id,
+            dedupe_key=external_message_id,
+        )
+        if not accepted:
+            self.ctx.logger.debug(f"Host 丢弃了 SnowLuma 入站消息: {external_message_id or '无消息 ID'}")
+
+    async def _route_inbound_notice(self, payload: Dict[str, Any]) -> None:
+        """将 SnowLuma 通知事件转换为 Host 标准通知消息并注入。"""
+
+        if not self._is_inbound_notice_allowed(payload):
+            return
+
+        try:
+            message_dict = await self._build_inbound_notice_message_dict(payload)
+        except ValueError as exc:
+            self.ctx.logger.warning(f"SnowLuma 通知事件格式不受支持，已丢弃: {exc}")
+            return
+
+        notice_message_id = str(message_dict.get("message_id") or "").strip()
+        route_metadata: Dict[str, Any] = {}
+        if self._connected_account_id:
+            route_metadata["self_id"] = self._connected_account_id
+        if connection_id := self._load_settings().luma_client.connection_id:
+            route_metadata["connection_id"] = connection_id
+
+        accepted = await self.ctx.gateway.route_message(
+            gateway_name=SNOWLUMA_GATEWAY_NAME,
+            message=message_dict,
+            route_metadata=route_metadata,
+            external_message_id=notice_message_id,
+            dedupe_key=notice_message_id,
+        )
+        if not accepted:
+            self.ctx.logger.debug(f"Host 丢弃了 SnowLuma 通知事件: {notice_message_id or '无通知 ID'}")
+
+    def _is_inbound_message_allowed(self, payload: Mapping[str, Any]) -> bool:
+        """检查入站消息是否通过聊天黑白名单过滤。"""
+
+        settings = self._load_settings()
+        sender = payload.get("sender", {})
+        if not isinstance(sender, Mapping):
+            sender = {}
+
+        sender_user_id = str(payload.get("user_id") or sender.get("user_id") or "").strip()
+        group_id = str(payload.get("group_id") or "").strip()
+        if not sender_user_id:
+            return False
+
+        if (
+            settings.filters.ignore_self_message
+            and self._connected_account_id
+            and sender_user_id == self._connected_account_id
+        ):
+            return False
+
+        if sender_user_id in settings.chat.ban_user_id:
+            self.ctx.logger.warning(f"SnowLuma 用户 {sender_user_id} 在全局禁止名单中，消息已丢弃")
+            return False
+
+        if settings.chat.ban_qq_bot and self._is_official_qq_bot_payload(payload, sender):
+            self.ctx.logger.debug(f"SnowLuma 官方机器人消息已丢弃: user_id={sender_user_id}")
+            return False
+
+        if not group_id and self._has_active_private_chat_bypass(sender_user_id):
+            remaining_seconds = self._get_private_chat_bypass_remaining_seconds(sender_user_id)
+            self.ctx.logger.debug(
+                f"SnowLuma 私聊用户 {sender_user_id} 命中主动私聊临时放行，"
+                f"剩余 {remaining_seconds:.0f} 秒"
+            )
+            return True
+
+        if not settings.chat.enable_chat_list_filter:
+            return True
+
+        if group_id:
+            allowed = self._is_id_allowed_by_list_policy(
+                group_id,
+                settings.chat.group_list_type,
+                settings.chat.group_list,
+            )
+            if not allowed:
+                self._log_chat_list_rejection(
+                    settings.chat.show_dropped_chat_list_messages,
+                    f"SnowLuma 群聊 {group_id} 未通过聊天名单过滤，消息已丢弃",
+                )
+            return allowed
+
+        allowed = self._is_id_allowed_by_list_policy(
+            sender_user_id,
+            settings.chat.private_list_type,
+            settings.chat.private_list,
+        )
+        if not allowed:
+            self._log_chat_list_rejection(
+                settings.chat.show_dropped_chat_list_messages,
+                f"SnowLuma 私聊用户 {sender_user_id} 未通过聊天名单过滤，消息已丢弃",
+            )
+        return allowed
+
+    def _log_chat_list_rejection(self, enabled: bool, message: str) -> None:
+        """按配置决定是否记录聊天名单过滤丢弃日志。"""
+
+        if enabled:
+            self.ctx.logger.warning(message)
+
+    @staticmethod
+    def _is_id_allowed_by_list_policy(target_id: str, list_type: str, configured_ids: List[str]) -> bool:
+        """根据白名单或黑名单规则判断目标 ID 是否允许通过。"""
+
+        if list_type == "whitelist":
+            return target_id in configured_ids
+        return target_id not in configured_ids
+
+    @staticmethod
+    def _is_official_qq_bot_payload(payload: Mapping[str, Any], sender: Mapping[str, Any]) -> bool:
+        """尽力识别 QQ 官方机器人或频道机器人消息。"""
+
+        role_values = {
+            str(payload.get("sub_type") or "").lower(),
+            str(payload.get("message_sub_type") or "").lower(),
+            str(sender.get("role") or "").lower(),
+            str(sender.get("user_type") or "").lower(),
+        }
+        if role_values & {"qq_bot", "official_bot", "bot", "guild"}:
+            return True
+
+        sender_title = str(sender.get("title") or sender.get("card") or sender.get("nickname") or "").lower()
+        return "官方机器人" in sender_title or "qq bot" in sender_title
+
+    def _is_inbound_notice_allowed(self, payload: Mapping[str, Any]) -> bool:
+        """检查通知事件是否通过聊天黑白名单过滤。"""
+
+        settings = self._load_settings()
+        if not settings.notice.enabled:
+            return False
+
+        group_id = str(payload.get("group_id") or "").strip()
+        actor_user_id = self._resolve_notice_actor_user_id(payload)
+
+        if actor_user_id and actor_user_id in settings.chat.ban_user_id:
+            self.ctx.logger.warning(f"SnowLuma 用户 {actor_user_id} 在全局禁止名单中，通知已丢弃")
+            return False
+
+        if not settings.chat.enable_chat_list_filter:
+            return True
+
+        if group_id:
+            allowed = self._is_id_allowed_by_list_policy(
+                group_id,
+                settings.chat.group_list_type,
+                settings.chat.group_list,
+            )
+            if not allowed:
+                self._log_chat_list_rejection(
+                    settings.chat.show_dropped_chat_list_messages,
+                    f"SnowLuma 群聊 {group_id} 的通知未通过聊天名单过滤，通知已丢弃",
+                )
+            return allowed
+
+        if not actor_user_id:
+            return False
+
+        allowed = self._is_id_allowed_by_list_policy(
+            actor_user_id,
+            settings.chat.private_list_type,
+            settings.chat.private_list,
+        )
+        if not allowed:
+            self._log_chat_list_rejection(
+                settings.chat.show_dropped_chat_list_messages,
+                f"SnowLuma 私聊用户 {actor_user_id} 的通知未通过聊天名单过滤，通知已丢弃",
+            )
+        return allowed
+
+    async def _build_inbound_notice_message_dict(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """构造 Host 可接受的通知 MessageDict。"""
+
+        notice_type = str(payload.get("notice_type") or "").strip()
+        sub_type = str(payload.get("sub_type") or "").strip()
+        if not notice_type:
+            raise ValueError("缺少 notice_type")
+        if not self._is_notice_event_enabled(notice_type, sub_type):
+            raise ValueError(f"通知类型已关闭: {notice_type}.{sub_type or '<empty>'}")
+
+        plain_text = await self._build_notice_plain_text(payload, notice_type, sub_type)
+        if not plain_text:
+            raise ValueError(f"不支持的通知类型: {notice_type}.{sub_type or '<empty>'}")
+
+        group_id = str(payload.get("group_id") or "").strip()
+        actor_user_id = self._resolve_notice_actor_user_id(payload) or "0"
+        user_profile = await self._resolve_notice_user_profile(group_id, actor_user_id)
+        user_nickname = user_profile.get("nickname") or actor_user_id or "系统通知"
+        user_cardname = user_profile.get("card") or None
+
+        timestamp_seconds = payload.get("time")
+        if not isinstance(timestamp_seconds, (int, float)) or timestamp_seconds <= 0:
+            timestamp_seconds = time.time()
+
+        additional_config: Dict[str, Any] = {
+            "self_id": self._connected_account_id,
+            "snowluma_message_type": "notice",
+            "snowluma_notice_type": notice_type,
+            "snowluma_notice_sub_type": sub_type,
+            "snowluma_notice_payload": dict(payload),
+            # 兼容已有 NapCat 通知字段命名，便于主程序统一读取。
+            "napcat_notice_type": notice_type,
+            "napcat_notice_sub_type": sub_type,
+            "napcat_notice_payload": dict(payload),
+        }
+        target_id = str(payload.get("target_id") or "").strip()
+        if target_id:
+            additional_config["target_id"] = target_id
+        if group_id:
+            additional_config["platform_io_target_group_id"] = group_id
+        else:
+            additional_config["platform_io_target_user_id"] = actor_user_id
+
+        message_info: Dict[str, Any] = {
+            "user_info": {
+                "user_id": actor_user_id,
+                "user_nickname": user_nickname,
+                "user_cardname": user_cardname,
+            },
+            "additional_config": additional_config,
+        }
+        if group_id:
+            group_name = await self._resolve_group_name(payload, group_id)
+            message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
+
+        return {
+            "message_id": self._build_notice_message_id(payload, notice_type, sub_type),
+            "timestamp": str(float(timestamp_seconds)),
+            "platform": "qq",
+            "message_info": message_info,
+            "raw_message": [{"type": "text", "data": plain_text}],
+            "is_mentioned": False,
+            "is_at": False,
+            "is_emoji": False,
+            "is_picture": False,
+            "is_command": False,
+            "is_notify": True,
+            "session_id": "",
+            "processed_plain_text": plain_text,
+        }
+
+    @staticmethod
+    def _build_notice_message_id(payload: Mapping[str, Any], notice_type: str, sub_type: str) -> str:
+        """为通知事件生成唯一消息 ID，避免多条通知共用 ``notice``。"""
+
+        stable_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()[:16]
+        normalized_type = notice_type or "notice"
+        normalized_sub_type = sub_type or "event"
+        return f"notice:{normalized_type}:{normalized_sub_type}:{digest}"
+
+    def _is_notice_event_enabled(self, notice_type: str, sub_type: str) -> bool:
+        """按配置判断指定通知类型是否允许传递。"""
+
+        notice_settings = self._load_settings().notice
+        if notice_type == "notify":
+            if sub_type == "poke":
+                return notice_settings.enable_poke
+            if sub_type == "group_name":
+                return notice_settings.enable_group_name
+            return False
+
+        notice_type_fields = {
+            "friend_recall": "enable_friend_recall",
+            "group_recall": "enable_group_recall",
+            "group_ban": "enable_group_ban",
+            "group_msg_emoji_like": "enable_group_msg_emoji_like",
+            "group_upload": "enable_group_upload",
+            "group_increase": "enable_group_increase",
+            "group_decrease": "enable_group_decrease",
+            "group_admin": "enable_group_admin",
+            "essence": "enable_essence",
+        }
+        field_name = notice_type_fields.get(notice_type)
+        if field_name is None:
+            return False
+        return bool(getattr(notice_settings, field_name))
+
+    @staticmethod
+    def _resolve_notice_actor_user_id(payload: Mapping[str, Any]) -> str:
+        """解析通知事件的操作者 ID。"""
+
+        for field_name in ("operator_id", "user_id", "sender_id", "target_id", "self_id"):
+            value = str(payload.get(field_name) or "").strip()
+            if value:
+                return value
+        return ""
+
+    async def _resolve_notice_user_profile(self, group_id: str, user_id: str) -> Dict[str, str]:
+        """解析通知事件中的用户昵称和群名片。"""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id or normalized_user_id == "0":
+            return {"nickname": "系统通知"}
+
+        if group_id:
+            resolved_names = await self._resolve_group_member_names(group_id, normalized_user_id)
+            if resolved_names:
+                return resolved_names
+
+        try:
+            response = await self._call_action(
+                "get_stranger_info",
+                {"user_id": self._normalize_positive_id(normalized_user_id, "user_id")},
+            )
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 查询用户信息失败: user_id={normalized_user_id} error={exc}")
+            return {"nickname": normalized_user_id}
+
+        user_info = response.get("data", response)
+        if not isinstance(user_info, Mapping):
+            return {"nickname": normalized_user_id}
+
+        nickname = str(user_info.get("nickname") or user_info.get("name") or normalized_user_id).strip()
+        return {"nickname": nickname or normalized_user_id}
+
+    async def _resolve_notice_display_name(self, group_id: str, user_id: Any, *, default: str = "QQ用户") -> str:
+        """解析通知文本中展示用的用户名。"""
+
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return default
+        if normalized_user_id == "0":
+            return "全体成员"
+
+        user_profile = await self._resolve_notice_user_profile(group_id, normalized_user_id)
+        return user_profile.get("card") or user_profile.get("nickname") or normalized_user_id
+
+    async def _build_notice_plain_text(self, payload: Mapping[str, Any], notice_type: str, sub_type: str) -> str:
+        """将 OneBot 通知事件渲染成麦麦可读文本。"""
+
+        group_id = str(payload.get("group_id") or "").strip()
+        if notice_type == "notify":
+            if sub_type == "poke":
+                return await self._build_poke_notice_text(payload, group_id)
+            if sub_type == "group_name":
+                new_name = str(payload.get("name_new") or payload.get("group_name") or "").strip()
+                return f"[事件-群名变更] 群名称变更为 {new_name or '未知名称'}"
+            return ""
+
+        if notice_type == "friend_recall":
+            user_name = await self._resolve_notice_display_name("", payload.get("user_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            return f"[事件-好友撤回] {user_name} 撤回了一条消息{suffix}"
+
+        if notice_type == "group_recall":
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            if operator_name and user_name and operator_name != user_name:
+                return f"[事件-群消息撤回] {operator_name} 撤回了 {user_name} 的消息{suffix}"
+            return f"[事件-群消息撤回] {operator_name or user_name} 撤回了一条消息{suffix}"
+
+        if notice_type == "group_ban":
+            return await self._build_group_ban_notice_text(payload, group_id, sub_type)
+
+        if notice_type == "group_msg_emoji_like":
+            return await self._build_emoji_like_notice_text(payload, group_id)
+
+        if notice_type == "group_upload":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            file_info = payload.get("file", {})
+            if not isinstance(file_info, Mapping):
+                file_info = {}
+            file_name = str(file_info.get("name") or file_info.get("file") or "未知文件").strip()
+            file_size = str(file_info.get("size") or file_info.get("file_size") or "").strip()
+            size_suffix = f"，大小 {file_size}" if file_size else ""
+            return f"[事件-群文件上传] {user_name} 上传了文件 {file_name}{size_suffix}"
+
+        if notice_type == "group_increase":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            increase_type = sub_type or str(payload.get("increase_type") or "").strip()
+            action_text = "被邀请入群" if increase_type == "invite" else "加入了群聊"
+            return f"[事件-群成员增加] {user_name} {action_text}"
+
+        if notice_type == "group_decrease":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            if sub_type == "kick_me":
+                return "[事件-群成员减少] 麦麦被移出了群聊"
+            if sub_type == "kick":
+                return f"[事件-群成员减少] {user_name} 被 {operator_name} 移出了群聊"
+            return f"[事件-群成员减少] {user_name} 离开了群聊"
+
+        if notice_type == "group_admin":
+            user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+            action_text = "被设为管理员" if sub_type == "set" else "被取消管理员"
+            return f"[事件-群管理员变动] {user_name} {action_text}"
+
+        if notice_type == "essence":
+            operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+            sender_name = await self._resolve_notice_display_name(group_id, payload.get("sender_id"))
+            message_id = str(payload.get("message_id") or "").strip()
+            suffix = f"（消息ID:{message_id}）" if message_id else ""
+            if sub_type == "add":
+                return f"[事件-精华消息] {operator_name} 将 {sender_name} 的消息设为精华{suffix}"
+            if sub_type == "delete":
+                return f"[事件-精华消息] {operator_name} 移除了 {sender_name} 的精华消息{suffix}"
+            return f"[事件-精华消息] 精华消息发生变动{suffix}"
+
+        return ""
+
+    async def _build_poke_notice_text(self, payload: Mapping[str, Any], group_id: str) -> str:
+        """构造戳一戳通知文本。"""
+
+        self_id = str(payload.get("self_id") or self._connected_account_id or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        target_id = str(payload.get("target_id") or "").strip()
+        if self_id and user_id == self_id:
+            return ""
+
+        user_name = await self._resolve_notice_display_name(group_id, user_id)
+        target_name = await self._resolve_notice_display_name(group_id, target_id, default="麦麦")
+
+        first_text = "戳了戳"
+        second_text = ""
+        raw_info = payload.get("raw_info")
+        if isinstance(raw_info, list):
+            first_text = self._extract_poke_raw_text(raw_info, 2, first_text)
+            second_text = self._extract_poke_raw_text(raw_info, 4, second_text)
+
+        if self_id and target_id == self_id:
+            display_name = ""
+        elif group_id:
+            display_name = user_name
+        else:
+            return ""
+
+        return f"{display_name}{first_text}{target_name}{second_text}（这是QQ的一个功能，用于提及某人，但没那么明显）"
+
+    @staticmethod
+    def _extract_poke_raw_text(raw_info: List[Any], index: int, default: str) -> str:
+        """从戳一戳 raw_info 中提取动作文本。"""
+
+        if index >= len(raw_info):
+            return default
+        raw_item = raw_info[index]
+        if not isinstance(raw_item, Mapping):
+            return default
+        return str(raw_item.get("txt") or default)
+
+    async def _build_group_ban_notice_text(self, payload: Mapping[str, Any], group_id: str, sub_type: str) -> str:
+        """构造群禁言通知文本。"""
+
+        operator_name = await self._resolve_notice_display_name(group_id, payload.get("operator_id"))
+        target_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+        duration = payload.get("duration")
+        if sub_type == "ban":
+            if str(payload.get("user_id") or "").strip() == "0":
+                return f"[事件-群禁言] {operator_name} 开启了全员禁言"
+            duration_text = f"，时长 {duration} 秒" if duration not in (None, "") else ""
+            return f"[事件-群禁言] {operator_name} 禁言了 {target_name}{duration_text}"
+        if sub_type == "lift_ban":
+            if str(payload.get("user_id") or "").strip() == "0":
+                return f"[事件-群禁言] {operator_name} 解除了全员禁言"
+            return f"[事件-群禁言] {operator_name} 解除了 {target_name} 的禁言"
+        return ""
+
+    async def _build_emoji_like_notice_text(self, payload: Mapping[str, Any], group_id: str) -> str:
+        """构造群消息表情回应通知文本。"""
+
+        user_name = await self._resolve_notice_display_name(group_id, payload.get("user_id"))
+        likes = payload.get("likes", [])
+        emoji_texts: List[str] = []
+        if isinstance(likes, list):
+            for like in likes:
+                if not isinstance(like, Mapping):
+                    continue
+                emoji_id = str(like.get("emoji_id") or "").strip()
+                count = like.get("count", 1)
+                emoji_text = QQ_FACE_DESCRIPTIONS.get(emoji_id, f"未知表情{emoji_id}") if emoji_id else "未知表情"
+                if count and count != 1:
+                    emoji_texts.append(f"[{emoji_text}]x{count}")
+                else:
+                    emoji_texts.append(f"[{emoji_text}]")
+        emoji_summary = "、".join(emoji_texts) if emoji_texts else "未知表情"
+        message_id = str(payload.get("message_id") or "").strip()
+        return f"[事件-群消息表情回应] {user_name} 对消息(ID:{message_id or '未知'})表达了 {emoji_summary}"
+
+    async def _build_inbound_message_dict(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """构造 Host 可接受的 MessageDict。"""
+
+        sender = payload.get("sender", {})
+        if not isinstance(sender, Mapping):
+            sender = {}
+
+        user_id = str(payload.get("user_id") or sender.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("缺少 user_id")
+
+        message_type = str(payload.get("message_type") or "").strip()
+        if message_type not in {"private", "group"}:
+            raise ValueError(f"不支持或缺少 message_type: {message_type or '<empty>'}")
+        group_id = str(payload.get("group_id") or "").strip()
+        if message_type == "group" and not group_id:
+            raise ValueError("群消息缺少 group_id")
+        user_nickname = str(sender.get("nickname") or sender.get("card") or user_id).strip() or user_id
+        user_cardname = str(sender.get("card") or "").strip() or None
+
+        inbound_raw_message = payload.get("message")
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 入站原始消息段: "
+                f"message_id={payload.get('message_id')!r} "
+                f"message={json.dumps(inbound_raw_message, ensure_ascii=False, default=str)}"
+            )
+
+        platform_card_payloads: List[Dict[str, Any]] = []
+        raw_message, plain_text, is_at, is_picture = await self._convert_inbound_segments(
+            inbound_raw_message,
+            platform_card_payloads=platform_card_payloads,
+        )
+        if not raw_message:
+            raise ValueError("消息内容为空或没有可转换的消息段")
+
+        timestamp_seconds = payload.get("time")
+        if not isinstance(timestamp_seconds, (int, float)) or timestamp_seconds <= 0:
+            timestamp_seconds = time.time()
+
+        additional_config: Dict[str, Any] = {
+            "self_id": self._connected_account_id,
+            "snowluma_message_type": message_type,
+        }
+        if message_type == "group":
+            additional_config["platform_io_target_group_id"] = group_id
+        else:
+            additional_config["platform_io_target_user_id"] = user_id
+        if platform_card_payloads:
+            additional_config["platform_card_payloads"] = platform_card_payloads
+
+        message_info: Dict[str, Any] = {
+            "user_info": {
+                "user_id": user_id,
+                "user_nickname": user_nickname,
+                "user_cardname": user_cardname,
+            },
+            "additional_config": additional_config,
+        }
+        if message_type == "group":
+            group_name = await self._resolve_group_name(payload, group_id)
+            message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
+
+        message_id = str(payload.get("message_id") or "").strip()
+        if not message_id:
+            raise ValueError("缺少 message_id")
+        message_dict: Dict[str, Any] = {
+            "message_id": message_id,
+            "timestamp": str(float(timestamp_seconds)),
+            "platform": "qq",
+            "message_info": message_info,
+            "raw_message": raw_message,
+            "is_mentioned": is_at,
+            "is_at": is_at,
+            "is_emoji": False,
+            "is_picture": is_picture,
+            "is_command": plain_text.startswith("/"),
+            "is_notify": False,
+            "session_id": "",
+            "processed_plain_text": plain_text,
+        }
+        reply_to = self._extract_reply_target_id(raw_message)
+        if reply_to:
+            message_dict["reply_to"] = reply_to
+        return message_dict
+
+    async def _resolve_group_name(self, payload: Mapping[str, Any], group_id: str) -> str:
+        """解析群名称，优先使用推送字段，缺失时查询 SnowLuma。"""
+
+        raw_group_name = str(payload.get("group_name") or "").strip()
+        if raw_group_name:
+            self._group_name_cache[group_id] = raw_group_name
+            return raw_group_name
+
+        cached_group_name = self._group_name_cache.get(group_id, "")
+        if cached_group_name:
+            return cached_group_name
+
+        try:
+            response = await self._call_action("get_group_info", {"group_id": group_id})
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 查询群名称失败: group_id={group_id} error={exc}")
+            return f"group_{group_id}"
+
+        group_info = response.get("data", response)
+        if isinstance(group_info, Mapping):
+            resolved_group_name = str(group_info.get("group_name") or "").strip()
+            if resolved_group_name:
+                self._group_name_cache[group_id] = resolved_group_name
+                return resolved_group_name
+
+        return f"group_{group_id}"
+
+    async def _resolve_group_member_names(self, group_id: str, user_id: str) -> Dict[str, str]:
+        """通过 SnowLuma 查询群成员名片和昵称。"""
+
+        normalized_group_id = str(group_id or "").strip()
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_group_id or not normalized_user_id:
+            return {}
+
+        cache_key = (normalized_group_id, normalized_user_id)
+        if cache_key in self._group_member_cache:
+            return self._group_member_cache[cache_key]
+
+        try:
+            response = await self._call_action(
+                "get_group_member_info",
+                {
+                    "group_id": self._normalize_positive_id(normalized_group_id, "group_id"),
+                    "user_id": self._normalize_positive_id(normalized_user_id, "user_id"),
+                    "no_cache": True,
+                },
+            )
+        except Exception as exc:
+            self.ctx.logger.debug(
+                "SnowLuma 查询转发节点发送者信息失败: "
+                f"group_id={normalized_group_id} user_id={normalized_user_id} error={exc}"
+            )
+            self._group_member_cache[cache_key] = {}
+            return {}
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 转发节点群成员信息响应: "
+                f"group_id={normalized_group_id!r} user_id={normalized_user_id!r} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        member_info = response.get("data", response)
+        if not isinstance(member_info, Mapping):
+            self._group_member_cache[cache_key] = {}
+            return {}
+
+        resolved_names = self._extract_member_name_fields(member_info)
+        self._group_member_cache[cache_key] = resolved_names
+        return resolved_names
+
+    @staticmethod
+    def _extract_member_name_fields(member_info: Mapping[str, Any]) -> Dict[str, str]:
+        """从 SnowLuma/NapCat 用户信息字段中提取名片和昵称。"""
+
+        resolved_names: Dict[str, str] = {}
+        cardname = str(member_info.get("card") or "").strip()
+        nickname = str(member_info.get("nickname") or "").strip()
+        if cardname:
+            resolved_names["card"] = cardname
+        if nickname:
+            resolved_names["nickname"] = nickname
+        return resolved_names
+
+    async def _convert_inbound_segments(
+        self,
+        raw_message: Any,
+        *,
+        platform_card_payloads: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], str, bool, bool]:
+        """转换 OneBot 消息段为 Host 消息段。"""
+
+        if isinstance(raw_message, str):
+            return ([{"type": "text", "data": raw_message}], raw_message, False, False)
+
+        if not isinstance(raw_message, list):
+            return ([], "", False, False)
+
+        segments: List[Dict[str, Any]] = []
+        plain_text_parts: List[str] = []
+        is_at = False
+        is_picture = False
+        for item in raw_message:
+            if not isinstance(item, Mapping):
+                continue
+
+            item_type = str(item.get("type") or "").strip()
+            item_data = item.get("data", {})
+            if not isinstance(item_data, Mapping):
+                item_data = {}
+
+            if item_type == "text":
+                text = str(item_data.get("text") or "")
+                if text:
+                    segments.append({"type": "text", "data": text})
+                    plain_text_parts.append(text)
+                continue
+
+            if item_type == "at":
+                target_user_id = str(item_data.get("qq") or "").strip()
+                if target_user_id:
+                    segments.append(
+                        {
+                            "type": "at",
+                            "data": {
+                                "target_user_id": target_user_id,
+                                "target_user_nickname": None,
+                                "target_user_cardname": None,
+                            },
+                        }
+                    )
+                    plain_text_parts.append(f"@{target_user_id}")
+                    if self._connected_account_id and target_user_id == self._connected_account_id:
+                        is_at = True
+                continue
+
+            if item_type == "reply":
+                target_message_id = self._normalize_inbound_reply_id(item_data.get("id"))
+                if target_message_id:
+                    segments.append({"type": "reply", "data": {"target_message_id": target_message_id}})
+                continue
+
+            if item_type == "image":
+                image_ref = str(item_data.get("url") or item_data.get("file") or "").strip()
+                is_emoji_segment = self._is_emoji_image_segment(item_data)
+                image_segment = await self._build_inbound_binary_segment(
+                    "emoji" if is_emoji_segment else "image",
+                    image_ref,
+                    "[emoji]" if is_emoji_segment else "[image]",
+                    item_data,
+                )
+                segments.append(image_segment)
+                plain_text_parts.append("[image]")
+                is_picture = True
+                continue
+
+            if item_type == "record":
+                voice_ref = str(item_data.get("url") or item_data.get("file") or "").strip()
+                voice_segment = await self._build_inbound_binary_segment("voice", voice_ref, "[voice]", item_data)
+                segments.append(voice_segment)
+                plain_text_parts.append("[voice]")
+                continue
+
+            if item_type == "file":
+                file_text = self._build_inbound_file_text(item_data)
+                segments.append(
+                    {
+                        "type": "dict",
+                        "data": {
+                            "type": "file",
+                            "data": self._build_inbound_file_payload(item_data),
+                        },
+                    }
+                )
+                plain_text_parts.append(file_text)
+                continue
+
+            if item_type == "json":
+                parsed_json = self._parse_inbound_json_card_payload(item_data)
+                if parsed_json is not None:
+                    self._append_platform_card_payload(platform_card_payloads, parsed_json)
+                json_text = self._build_inbound_json_card_text(item_data, parsed_json=parsed_json)
+                segments.append({"type": "text", "data": json_text})
+                plain_text_parts.append(json_text)
+                continue
+
+            if item_type in {"face", "emoji"}:
+                text = self._build_inbound_face_text(item_data)
+                segments.append({"type": "text", "data": text})
+                plain_text_parts.append(text)
+                continue
+
+            if item_type == "forward":
+                forward_segment = await self._build_inbound_forward_segment(item_data)
+                segments.append(forward_segment)
+                plain_text_parts.append(self._build_forward_plain_text(forward_segment))
+                continue
+
+            unknown_type = item_type or "unknown"
+            segments.append({"type": "dict", "data": {"type": unknown_type, "data": dict(item_data)}})
+            plain_text_parts.append(f"[{unknown_type}]")
+
+        return segments, "".join(plain_text_parts), is_at, is_picture
+
+    def _build_inbound_face_text(self, segment_data: Mapping[str, Any]) -> str:
+        """把 QQ 自带表情 face 段转成可读文本或近似 Unicode emoji。"""
+
+        face_id = str(segment_data.get("id") or "").strip()
+        if not face_id:
+            return "[QQ表情]"
+
+        settings = self._load_settings()
+        if settings.plugin.qq_face_parse_mode == "emoji":
+            emoji_text = QQ_FACE_EMOJIS.get(face_id)
+            if emoji_text:
+                return emoji_text
+
+        description = QQ_FACE_DESCRIPTIONS.get(face_id)
+        if description:
+            return f"[{description}]"
+        return f"[QQ表情:{face_id}]"
+
+    @staticmethod
+    def _build_inbound_file_text(segment_data: Mapping[str, Any]) -> str:
+        """把 OneBot 文件段转成可读文本。"""
+
+        file_name = str(
+            segment_data.get("file")
+            or segment_data.get("name")
+            or segment_data.get("file_name")
+            or segment_data.get("filename")
+            or ""
+        ).strip()
+        file_size = str(segment_data.get("file_size") or segment_data.get("size") or "").strip()
+        file_url = str(segment_data.get("url") or segment_data.get("file_url") or "").strip()
+
+        text_parts: List[str] = []
+        if file_name:
+            text_parts.append(file_name)
+        if file_size:
+            text_parts.append(f"大小: {file_size}")
+
+        file_text = "[文件]"
+        if text_parts:
+            file_text = f"[文件] {'，'.join(text_parts)}"
+        if file_url:
+            file_text = f"{file_text}，链接: {file_url}"
+        return file_text
+
+    @staticmethod
+    def _build_inbound_file_payload(segment_data: Mapping[str, Any]) -> Dict[str, Any]:
+        """保留 OneBot 文件段的结构化信息，供复杂消息工具展开。"""
+
+        file_name = str(
+            segment_data.get("file")
+            or segment_data.get("name")
+            or segment_data.get("file_name")
+            or segment_data.get("filename")
+            or ""
+        ).strip()
+        file_size = str(segment_data.get("file_size") or segment_data.get("size") or "").strip()
+        file_url = str(segment_data.get("url") or segment_data.get("file_url") or "").strip()
+        file_id = str(segment_data.get("file_id") or segment_data.get("id") or "").strip()
+
+        payload: Dict[str, Any] = {}
+        if file_name:
+            payload["name"] = file_name
+            payload["file"] = file_name
+        if file_size:
+            payload["size"] = file_size
+            payload["file_size"] = file_size
+        if file_url:
+            payload["url"] = file_url
+        if file_id:
+            payload["file_id"] = file_id
+        return payload
+
+    @staticmethod
+    def _parse_inbound_json_card_payload(segment_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """解析 OneBot JSON 卡片原始载荷。"""
+
+        raw_json = str(segment_data.get("data") or "").strip()
+        if not raw_json:
+            return None
+
+        try:
+            parsed_json = json.loads(raw_json)
+        except Exception:
+            return None
+
+        if not isinstance(parsed_json, Mapping):
+            return None
+        return dict(parsed_json)
+
+    @staticmethod
+    def _append_platform_card_payload(
+        platform_card_payloads: Optional[List[Dict[str, Any]]],
+        parsed_json: Mapping[str, Any],
+    ) -> None:
+        """保留平台卡片元数据，供下游插件识别小程序卡片。"""
+
+        if platform_card_payloads is None:
+            return
+
+        app_name = str(parsed_json.get("app") or "").strip()
+        if app_name != "com.tencent.miniapp_01":
+            return
+
+        platform_card_payloads.append(
+            {
+                "type": "miniapp_card",
+                "app": app_name,
+                "payload": dict(parsed_json),
+            }
+        )
+
+    def _build_inbound_json_card_text(
+        self,
+        segment_data: Mapping[str, Any],
+        *,
+        parsed_json: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """把 OneBot JSON 卡片转成可读文本摘要。"""
+
+        if parsed_json is None:
+            parsed_json = self._parse_inbound_json_card_payload(segment_data)
+        if parsed_json is None:
+            return "[json]"
+
+        prompt = str(parsed_json.get("prompt") or "").strip()
+        app_name = str(parsed_json.get("app") or "").strip()
+        meta = parsed_json.get("meta", {})
+        if not isinstance(meta, Mapping):
+            meta = {}
+
+        card_parts = self._extract_json_card_parts(meta)
+        title = card_parts.get("title", "")
+        desc = card_parts.get("desc", "")
+        url = card_parts.get("url", "")
+        tag = card_parts.get("tag", "") or prompt or app_name or "json"
+
+        text_parts: List[str] = [f"[卡片:{tag}]"]
+        if title and title not in text_parts:
+            text_parts.append(title)
+        if desc and desc != title:
+            text_parts.append(desc)
+        if url:
+            text_parts.append(f"链接: {url}")
+        return " ".join(part for part in text_parts if part).strip() or "[json]"
+
+    def _extract_json_card_parts(self, meta: Mapping[str, Any]) -> Dict[str, str]:
+        """从常见 QQ JSON 卡片 meta 中提取标题、描述、链接。"""
+
+        for nested_value in meta.values():
+            if not isinstance(nested_value, Mapping):
+                continue
+
+            title = str(
+                nested_value.get("title")
+                or nested_value.get("name")
+                or nested_value.get("prompt")
+                or nested_value.get("text")
+                or ""
+            ).strip()
+            desc = str(
+                nested_value.get("desc")
+                or nested_value.get("summary")
+                or nested_value.get("forwardMessage")
+                or nested_value.get("content")
+                or ""
+            ).strip()
+            url = str(
+                nested_value.get("qqdocurl")
+                or nested_value.get("url")
+                or nested_value.get("jumpUrl")
+                or nested_value.get("musicUrl")
+                or ""
+            ).strip()
+            tag = str(nested_value.get("tag") or nested_value.get("tagName") or "").strip()
+            if title or desc or url or tag:
+                return {"title": title, "desc": desc, "url": url, "tag": tag}
+
+        return {"title": "", "desc": "", "url": "", "tag": ""}
+
+    def _build_forward_plain_text(self, forward_segment: Mapping[str, Any]) -> str:
+        """为合并转发构造可读摘要，避免上下文里只剩 ``[forward]``。"""
+
+        if forward_segment.get("type") != "forward":
+            return str(forward_segment.get("data") or "[forward]")
+
+        raw_nodes = forward_segment.get("data")
+        if not isinstance(raw_nodes, list) or not raw_nodes:
+            return "[forward]"
+
+        preview_lines: List[str] = ["【合并转发消息:"]
+        for raw_node in raw_nodes[:8]:
+            if not isinstance(raw_node, Mapping):
+                continue
+
+            sender_name = str(
+                raw_node.get("user_cardname")
+                or raw_node.get("user_nickname")
+                or raw_node.get("user_id")
+                or "未知用户"
+            )
+            content_text = self._build_forward_node_plain_text(raw_node.get("content"))
+            preview_lines.append(f"【{sender_name}】: {content_text or '[empty]'}")
+
+        total_count = len(raw_nodes)
+        if total_count > 8:
+            preview_lines.append(f"... 其余 {total_count - 8} 条已省略")
+        preview_lines.append("】")
+        return "\n".join(preview_lines)
+
+    def _build_forward_node_plain_text(self, raw_content: Any) -> str:
+        """把单个转发节点的 Host 消息段渲染成轻量文本。"""
+
+        if not isinstance(raw_content, list):
+            return ""
+
+        text_parts: List[str] = []
+        for segment in raw_content:
+            if not isinstance(segment, Mapping):
+                continue
+
+            segment_type = str(segment.get("type") or "").strip()
+            segment_data = segment.get("data")
+            if segment_type == "text":
+                text_parts.append(str(segment_data or ""))
+                continue
+
+            if segment_type == "at":
+                if isinstance(segment_data, Mapping):
+                    target_name = str(
+                        segment_data.get("target_user_cardname")
+                        or segment_data.get("target_user_nickname")
+                        or segment_data.get("target_user_id")
+                        or ""
+                    ).strip()
+                else:
+                    target_name = str(segment_data or "").strip()
+                if target_name:
+                    text_parts.append(f"@{target_name}")
+                continue
+
+            if segment_type == "image":
+                text_parts.append("[image]")
+                continue
+
+            if segment_type == "emoji":
+                text_parts.append("[emoji]")
+                continue
+
+            if segment_type == "voice":
+                text_parts.append("[voice]")
+                continue
+
+            if segment_type == "reply":
+                text_parts.append("[reply]")
+                continue
+
+            if segment_type == "forward":
+                text_parts.append("[forward]")
+                continue
+
+            if segment_type:
+                text_parts.append(f"[{segment_type}]")
+
+        return "".join(text_parts)
+
+    async def _build_inbound_forward_segment(self, segment_data: Mapping[str, Any]) -> Dict[str, Any]:
+        """展开 OneBot 合并转发消息段。"""
+
+        messages = self._extract_forward_messages(segment_data)
+        if messages is None:
+            forward_id = str(segment_data.get("id") or "").strip()
+            if not forward_id:
+                return {"type": "text", "data": "[forward]"}
+
+            try:
+                response = await self._call_action("get_forward_msg", {"id": forward_id})
+            except Exception as exc:
+                self.ctx.logger.debug(f"SnowLuma 获取合并转发详情失败: id={forward_id} error={exc}")
+                return {"type": "text", "data": "[forward]"}
+
+            if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+                self.ctx.logger.info(
+                    "SnowLuma 合并转发详情响应: "
+                    f"id={forward_id!r} response={json.dumps(response, ensure_ascii=False, default=str)}"
+                )
+
+            messages = self._extract_forward_messages(response)
+
+        if not isinstance(messages, list):
+            return {"type": "text", "data": "[forward]"}
+
+        forward_nodes = await self._build_inbound_forward_nodes(messages)
+        if not forward_nodes:
+            return {"type": "text", "data": "[forward]"}
+
+        return {"type": "forward", "data": forward_nodes}
+
+    def _extract_forward_messages(self, payload: Mapping[str, Any]) -> Optional[List[Any]]:
+        """从合并转发载荷中提取节点列表。"""
+
+        direct_messages = payload.get("messages")
+        if isinstance(direct_messages, list):
+            return direct_messages
+
+        direct_content = payload.get("content")
+        if isinstance(direct_content, list):
+            return direct_content
+
+        nested_data = payload.get("data")
+        if isinstance(nested_data, Mapping):
+            nested_messages = nested_data.get("messages")
+            if isinstance(nested_messages, list):
+                return nested_messages
+
+            nested_content = nested_data.get("content")
+            if isinstance(nested_content, list):
+                return nested_content
+
+        return None
+
+    async def _build_inbound_forward_nodes(self, messages: List[Any]) -> List[Dict[str, Any]]:
+        """转换 SnowLuma/NapCat 返回的合并转发节点。"""
+
+        forward_nodes: List[Dict[str, Any]] = []
+        for forward_message in messages:
+            if not isinstance(forward_message, Mapping):
+                continue
+
+            raw_content = self._extract_forward_node_content(forward_message)
+            content_segments, _, _, _ = await self._convert_inbound_segments(raw_content)
+            if not content_segments:
+                continue
+
+            sender = self._extract_forward_node_sender(forward_message)
+            node_data = forward_message.get("data", {})
+            if not isinstance(node_data, Mapping):
+                node_data = {}
+
+            node_payload = self._extract_forward_node_payload(forward_message)
+            node_user_id = str(
+                sender.get("user_id")
+                or sender.get("uin")
+                or sender.get("id")
+                or node_payload.get("user_id")
+                or node_payload.get("uin")
+                or node_payload.get("id")
+                or node_data.get("user_id")
+                or node_data.get("uin")
+                or node_data.get("id")
+                or ""
+            ).strip()
+            node_cardname = str(sender.get("card") or node_payload.get("card") or node_data.get("card") or "").strip()
+            node_nickname = str(
+                sender.get("nickname")
+                or sender.get("name")
+                or node_payload.get("nickname")
+                or node_payload.get("name")
+                or node_data.get("nickname")
+                or node_data.get("name")
+                or ""
+            ).strip()
+            node_group_id = str(
+                forward_message.get("group_id")
+                or node_payload.get("group_id")
+                or node_data.get("group_id")
+                or ""
+            ).strip()
+            if node_user_id and node_group_id and (not node_cardname or not node_nickname):
+                resolved_names = await self._resolve_group_member_names(node_group_id, node_user_id)
+                node_cardname = node_cardname or resolved_names.get("card", "")
+                node_nickname = node_nickname or resolved_names.get("nickname", "")
+
+            forward_nodes.append(
+                {
+                    "user_id": node_user_id or None,
+                    "user_nickname": node_nickname or node_user_id or "未知用户",
+                    "user_cardname": node_cardname or None,
+                    "message_id": str(
+                        forward_message.get("message_id")
+                        or forward_message.get("id")
+                        or node_payload.get("message_id")
+                        or node_payload.get("id")
+                        or node_data.get("id")
+                        or ""
+                    ),
+                    "content": content_segments,
+                }
+            )
+        return forward_nodes
+
+    @staticmethod
+    def _extract_forward_node_payload(forward_message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """提取 OneBot ``node`` 段内层 ``data`` 作为节点主体。"""
+
+        if str(forward_message.get("type") or "").strip() == "node":
+            node_data = forward_message.get("data", {})
+            if isinstance(node_data, Mapping):
+                return node_data
+        return forward_message
+
+    @staticmethod
+    def _extract_forward_node_content(forward_message: Mapping[str, Any]) -> Any:
+        """提取单个合并转发节点中的消息段列表。"""
+
+        direct_content = forward_message.get("content")
+        if isinstance(direct_content, list):
+            return direct_content
+
+        direct_message = forward_message.get("message")
+        if isinstance(direct_message, list):
+            return direct_message
+
+        node_data = forward_message.get("data", {})
+        if not isinstance(node_data, Mapping):
+            return []
+
+        nested_content = node_data.get("content")
+        if isinstance(nested_content, list):
+            return nested_content
+
+        nested_message = node_data.get("message")
+        if isinstance(nested_message, list):
+            return nested_message
+
+        return []
+
+    @staticmethod
+    def _extract_forward_node_sender(forward_message: Mapping[str, Any]) -> Mapping[str, Any]:
+        """提取单个合并转发节点的发送者信息。"""
+
+        sender = forward_message.get("sender", {})
+        if isinstance(sender, Mapping):
+            return sender
+        if isinstance(sender, str) and sender.strip():
+            return {"nickname": sender.strip(), "name": sender.strip()}
+
+        node_data = forward_message.get("data", {})
+        if not isinstance(node_data, Mapping):
+            return {}
+
+        normalized_sender: Dict[str, Any] = {}
+        user_id = str(node_data.get("user_id") or node_data.get("uin") or node_data.get("id") or "").strip()
+        nickname = str(node_data.get("nickname") or node_data.get("name") or node_data.get("card") or "").strip()
+        cardname = str(node_data.get("card") or "").strip()
+        if user_id:
+            normalized_sender["user_id"] = user_id
+            normalized_sender["uin"] = user_id
+        if nickname:
+            normalized_sender["nickname"] = nickname
+            normalized_sender["name"] = nickname
+        if cardname:
+            normalized_sender["card"] = cardname
+        return normalized_sender
+
+    async def _build_inbound_binary_segment(
+        self,
+        segment_type: str,
+        file_reference: str,
+        fallback_text: str,
+        segment_data: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """构造 Host 可识别的入站媒体段。"""
+
+        if segment_type == "voice" and segment_data is not None:
+            binary_data = await self._load_binary_from_segment_data(segment_type, segment_data)
+            if not binary_data:
+                binary_data = await self._load_binary_reference(file_reference)
+        else:
+            binary_data = await self._load_binary_reference(file_reference)
+            if not binary_data and segment_data is not None:
+                binary_data = await self._load_binary_from_segment_data(segment_type, segment_data)
+        if not binary_data:
+            self.ctx.logger.debug(f"SnowLuma 媒体下载失败，降级为文本: type={segment_type} ref={file_reference[:120]}")
+            return {"type": "text", "data": fallback_text}
+        if segment_type == "voice" and self._is_silk_voice_binary(binary_data):
+            transcoded_binary = await self._transcode_silk_voice_binary(binary_data)
+            if not transcoded_binary:
+                self.ctx.logger.warning(
+                    "SnowLuma 收到 Silk 语音数据，get_record 未返回通用音频，且本地 Silk 转码失败，已降级为文本占位"
+                )
+                return {"type": "text", "data": fallback_text}
+            binary_data = transcoded_binary
+
+        return {
+            "type": segment_type,
+            "data": "",
+            "hash": self._hash_binary(binary_data),
+            "binary_data_base64": self._encode_binary(binary_data),
+        }
+
+    async def _load_binary_reference(self, file_reference: str) -> bytes:
+        """加载 OneBot 媒体引用中的二进制内容。"""
+
+        normalized_reference = str(file_reference or "").strip()
+        if not normalized_reference:
+            return b""
+
+        if normalized_reference.startswith("base64://"):
+            try:
+                return base64.b64decode(normalized_reference.removeprefix("base64://"))
+            except Exception:
+                return b""
+
+        if normalized_reference.startswith(("http://", "https://")):
+            session = self._session
+            if session is None:
+                return b""
+            try:
+                async with session.get(normalized_reference) as response:
+                    if response.status >= 400:
+                        return b""
+                    return await response.read()
+            except Exception as exc:
+                self.ctx.logger.debug(f"SnowLuma 下载媒体失败: {exc}")
+                return b""
+
+        try:
+            reference_path = Path(normalized_reference)
+            if reference_path.is_file():
+                return await asyncio.to_thread(reference_path.read_bytes)
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 读取本地媒体失败: path={normalized_reference[:120]} error={exc}")
+            return b""
+
+        return b""
+
+    async def _load_binary_from_segment_data(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
+        """从媒体段的标准引用字段或 OneBot 动作中加载二进制内容。"""
+
+        if segment_type == "voice":
+            binary_data = await self._load_binary_from_onebot_action(segment_type, segment_data)
+            if binary_data:
+                return binary_data
+
+        for field_name in ("base64", "data"):
+            raw_value = segment_data.get(field_name)
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            normalized_value = raw_value.strip()
+            if normalized_value.startswith("base64://"):
+                normalized_value = normalized_value.removeprefix("base64://")
+            try:
+                return base64.b64decode(normalized_value, validate=True)
+            except Exception:
+                continue
+
+        for field_name in ("url", "path", "file_path"):
+            binary_data = await self._load_binary_reference(str(segment_data.get(field_name) or ""))
+            if binary_data:
+                return binary_data
+
+        return await self._load_binary_from_onebot_action(segment_type, segment_data)
+
+    async def _load_binary_from_onebot_action(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
+        """通过 OneBot 动作加载媒体，语音交给 get_record 转码路径。"""
+
+        if segment_type == "voice":
+            return await self._load_voice_binary_from_onebot_action(segment_data)
+
+        file_name = str(segment_data.get("file") or "").strip()
+        if not file_name:
+            return b""
+
+        action_name = "get_image"
+        params: Dict[str, Any] = {"file": file_name}
+
+        try:
+            response = await self._call_action(action_name, params)
+        except Exception as exc:
+            self.ctx.logger.debug(
+                f"SnowLuma 通过动作加载媒体失败: action={action_name} type={segment_type} file={file_name} error={exc}"
+            )
+            return b""
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 媒体动作响应: "
+                f"action={action_name!r} type={segment_type!r} file={file_name!r} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        return await self._extract_binary_from_action_response(response)
+
+    async def _load_voice_binary_from_onebot_action(self, segment_data: Mapping[str, Any]) -> bytes:
+        """通过 get_record 获取已转码语音。"""
+
+        params = self._build_voice_record_action_params(segment_data)
+        if params is None:
+            return b""
+
+        try:
+            response = await self._call_action("get_record", params)
+        except Exception as exc:
+            self.ctx.logger.debug(f"SnowLuma 通过 get_record 加载语音失败: params={params} error={exc}")
+            return b""
+
+        if self._load_settings().plugin.enable_ada_debug_raw_message_log:
+            self.ctx.logger.info(
+                "SnowLuma 语音动作响应: "
+                f"action='get_record' params={json.dumps(params, ensure_ascii=False, default=str)} "
+                f"response={json.dumps(response, ensure_ascii=False, default=str)}"
+            )
+
+        binary_data = await self._extract_binary_from_action_response(response)
+        if binary_data:
+            if self._is_silk_voice_binary(binary_data):
+                response_data = response.get("data", {})
+                if not isinstance(response_data, Mapping):
+                    response_data = {}
+                returned_file = str(response_data.get("file") or "")[:120]
+                returned_file_name = str(response_data.get("file_name") or "")
+                self.ctx.logger.debug(
+                    "SnowLuma get_record 返回的媒体仍是 Silk 原始数据: "
+                    f"params={params} file_name={returned_file_name!r} file={returned_file!r}"
+                )
+            return binary_data
+        return b""
+
+    async def _extract_binary_from_action_response(self, response: Mapping[str, Any]) -> bytes:
+        """从 OneBot 动作响应中提取二进制媒体内容。"""
+
+        response_data = response.get("data", response)
+        if not isinstance(response_data, Mapping):
+            return b""
+
+        return await self._load_binary_reference(str(response_data.get("file") or ""))
+
+    @staticmethod
+    def _build_voice_record_action_params(segment_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """构造 OneBot get_record 请求参数。"""
+
+        file_name = str(segment_data.get("file") or "").strip()
+        if not file_name:
+            return None
+        return {"file": file_name, "out_format": "mp3"}
+
+    @staticmethod
+    def _is_silk_voice_binary(binary_data: bytes) -> bool:
+        """判断语音数据是否仍是 QQ Silk，避免误作为通用音频送入 ASR。"""
+
+        return binary_data.startswith(b"#!SILK_V3") or binary_data.startswith(b"\x02#!SILK_V3")
+
+    async def _transcode_silk_voice_binary(self, silk_binary: bytes) -> bytes:
+        """把 QQ Silk 语音转成 ASR 更容易识别的 MP3。"""
+
+        pcm_binary = await asyncio.to_thread(self._decode_silk_to_pcm_sync, silk_binary)
+        if not pcm_binary:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 解码失败：请安装插件依赖 silk-python")
+            return b""
+
+        ffmpeg_path = which("ffmpeg")
+        if not ffmpeg_path:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 失败：未找到 ffmpeg 可执行文件")
+            return b""
+
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            str(VOICE_TRANSCODE_SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-f",
+            "mp3",
+            "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            mp3_binary, stderr_binary = await asyncio.wait_for(
+                process.communicate(pcm_binary),
+                timeout=VOICE_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 超时")
+            return b""
+
+        if process.returncode != 0:
+            stderr_text = stderr_binary.decode("utf-8", errors="ignore").strip()
+            self.ctx.logger.warning(f"SnowLuma 本地 Silk 转 MP3 失败: {stderr_text[:200]}")
+            return b""
+
+        if not mp3_binary:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 失败：ffmpeg 未输出音频数据")
+            return b""
+        return mp3_binary
+
+    @staticmethod
+    def _decode_silk_to_pcm_sync(silk_binary: bytes) -> bytes:
+        """用 silk-python 解码 QQ Silk，返回 s16le PCM。"""
+
+        try:
+            pysilk = import_module("pysilk")
+        except ImportError:
+            return b""
+
+        silk_buffer = BytesIO(silk_binary)
+        pcm_buffer = BytesIO()
+        try:
+            pysilk.decode(silk_buffer, pcm_buffer, VOICE_TRANSCODE_SAMPLE_RATE)
+        except Exception:
+            return b""
+        return pcm_buffer.getvalue()
+
+    @staticmethod
+    def _is_emoji_image_segment(segment_data: Mapping[str, Any]) -> bool:
+        """判断 OneBot image 段是否更像表情包。"""
+
+        raw_sub_type = str(segment_data.get("sub_type") or segment_data.get("subType") or "").strip()
+        if raw_sub_type and raw_sub_type not in {"0", "4", "9", "normal"}:
+            return True
+
+        summary = str(segment_data.get("summary") or "").strip()
+        if "表情" in summary or "emoji" in summary.lower():
+            return True
+
+        return False
+
+    def _build_outbound_actions(
+        self,
+        message: Mapping[str, Any],
+        route: Mapping[str, Any],
+    ) -> List[OutboundAction]:
+        """将 Host 出站消息转换为 SnowLuma 动作序列。"""
+
+        message_info = message.get("message_info", {})
+        if not isinstance(message_info, Mapping):
+            message_info = {}
+
+        group_info = message_info.get("group_info", {})
+        if not isinstance(group_info, Mapping):
+            group_info = {}
+
+        additional_config = message_info.get("additional_config", {})
+        if not isinstance(additional_config, Mapping):
+            additional_config = {}
+
+        raw_message = message.get("raw_message", [])
+        target_group_id = str(
+            group_info.get("group_id")
+            or additional_config.get("platform_io_target_group_id")
+            or route.get("group_id")
+            or route.get("target_group_id")
+            or ""
+        ).strip()
+
+        target_user_id = str(
+            additional_config.get("platform_io_target_user_id")
+            or additional_config.get("target_user_id")
+            or route.get("user_id")
+            or route.get("target_user_id")
+            or ""
+        ).strip()
+
+        forward_messages = self._convert_outbound_forward_messages(raw_message)
+        if forward_messages:
+            if target_group_id:
+                return [("send_group_forward_msg", {"group_id": target_group_id, "messages": forward_messages})]
+            if not target_user_id:
+                raise ValueError("出站私聊消息缺少 target_user_id")
+            return [("send_private_forward_msg", {"user_id": target_user_id, "messages": forward_messages})]
+
+        outbound_items = self._convert_outbound_items(raw_message)
+        if target_group_id:
+            return self._build_targeted_outbound_actions(
+                outbound_items,
+                message_type="group",
+                target_field="group_id",
+                target_id=target_group_id,
+                file_action="upload_group_file",
+            )
+
+        if not target_user_id:
+            raise ValueError("出站私聊消息缺少 target_user_id")
+
+        return self._build_targeted_outbound_actions(
+            outbound_items,
+            message_type="private",
+            target_field="user_id",
+            target_id=target_user_id,
+            file_action="upload_private_file",
+        )
+
+    @staticmethod
+    def _build_targeted_outbound_actions(
+        outbound_items: List[Dict[str, Any]],
+        *,
+        message_type: str,
+        target_field: str,
+        target_id: str,
+        file_action: str,
+    ) -> List[OutboundAction]:
+        """按目标把普通消息段和文件上传动作拆成有序动作。"""
+
+        actions: List[OutboundAction] = []
+        pending_segments: List[Dict[str, Any]] = []
+
+        def flush_segments() -> None:
+            if not pending_segments:
+                return
+            actions.append(
+                (
+                    "send_msg",
+                    {
+                        "message_type": message_type,
+                        target_field: target_id,
+                        "message": list(pending_segments),
+                    },
+                )
+            )
+            pending_segments.clear()
+
+        for outbound_item in outbound_items:
+            item_kind = str(outbound_item.get("kind") or "").strip()
+            item_payload = outbound_item.get("payload")
+            if item_kind == "file" and isinstance(item_payload, Mapping):
+                flush_segments()
+                upload_params = dict(item_payload)
+                upload_params[target_field] = target_id
+                actions.append((file_action, upload_params))
+                continue
+            if item_kind == "segment" and isinstance(item_payload, Mapping):
+                pending_segments.append(dict(item_payload))
+
+        flush_segments()
+        if not actions:
+            raise ValueError("出站消息没有可转换的 OneBot 消息段")
+        return actions
+
+    def _convert_outbound_forward_messages(self, raw_message: Any) -> List[Dict[str, Any]]:
+        """将 Host 合并转发段转换为 OneBot node 消息段数组。"""
+
+        if not isinstance(raw_message, list):
+            return []
+
+        forward_messages: List[Dict[str, Any]] = []
+        for item in raw_message:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("type") or "").strip() != "forward":
+                continue
+
+            raw_nodes = item.get("data", [])
+            if not isinstance(raw_nodes, list):
+                continue
+            for raw_node in raw_nodes:
+                node = self._build_outbound_forward_node(raw_node)
+                if node:
+                    forward_messages.append(node)
+        return forward_messages
+
+    def _build_outbound_forward_node(self, raw_node: Any) -> Optional[Dict[str, Any]]:
+        """构造 SnowLuma 可发送的 OneBot 自定义转发节点。"""
+
+        if not isinstance(raw_node, Mapping):
+            return None
+
+        node_content = raw_node.get("content")
+        if node_content is None:
+            node_content = raw_node.get("raw_message", [])
+        content_segments = self._convert_outbound_segments(node_content)
+        if not content_segments:
+            return None
+
+        user_id = str(raw_node.get("user_id") or raw_node.get("uin") or "").strip()
+        if user_id == "0":
+            user_id = ""
+        if not user_id:
+            user_id = str(self._connected_account_id or "").strip()
+        if not user_id or user_id == "0":
+            self.ctx.logger.debug("SnowLuma 跳过缺少有效 user_id/uin 的出站转发节点")
+            return None
+        user_nickname = str(
+            raw_node.get("user_nickname")
+            or raw_node.get("nickname")
+            or raw_node.get("name")
+            or raw_node.get("user_cardname")
+            or "插件消息"
+        ).strip()
+
+        return {
+            "type": "node",
+            "data": {
+                "name": user_nickname,
+                "uin": user_id,
+                "user_id": user_id,
+                "nickname": user_nickname,
+                "content": content_segments,
+            },
+        }
+
+    def _convert_outbound_segments(self, raw_message: Any) -> List[Dict[str, Any]]:
+        """将 Host 消息段转换为 OneBot 消息段。"""
+
+        return [
+            dict(item["payload"])
+            for item in self._convert_outbound_items(raw_message)
+            if item.get("kind") == "segment" and isinstance(item.get("payload"), Mapping)
+        ]
+
+    def _convert_outbound_items(self, raw_message: Any) -> List[Dict[str, Any]]:
+        """将 Host 消息段转换为可发送的普通段或文件上传项。"""
+
+        if not isinstance(raw_message, list):
+            return []
+
+        outbound_items: List[Dict[str, Any]] = []
+        for item in raw_message:
+            if not isinstance(item, Mapping):
+                continue
+
+            item_type = str(item.get("type") or "").strip()
+            item_data = item.get("data")
+            if item_type == "text":
+                outbound_items.append(
+                    {"kind": "segment", "payload": {"type": "text", "data": {"text": str(item_data or "")}}}
+                )
+                continue
+
+            if item_type == "at" and isinstance(item_data, Mapping):
+                target_user_id = str(item_data.get("target_user_id") or "").strip()
+                if target_user_id:
+                    outbound_items.append({"kind": "segment", "payload": {"type": "at", "data": {"qq": target_user_id}}})
+                continue
+
+            if item_type == "reply":
+                target_message_id = ""
+                if isinstance(item_data, Mapping):
+                    target_message_id = str(item_data.get("target_message_id") or "").strip()
+                else:
+                    target_message_id = str(item_data or "").strip()
+                normalized_reply_id = self._normalize_outbound_reply_id(target_message_id)
+                if normalized_reply_id is not None:
+                    outbound_items.append(
+                        {"kind": "segment", "payload": {"type": "reply", "data": {"id": normalized_reply_id}}}
+                    )
+                elif target_message_id:
+                    self.ctx.logger.debug(f"SnowLuma 跳过无效回复目标消息 ID: {target_message_id}")
+                continue
+
+            if item_type == "image":
+                image_segment = self._build_media_segment("image", item, {"subType": 0})
+                if image_segment:
+                    outbound_items.append({"kind": "segment", "payload": image_segment})
+                continue
+
+            if item_type == "emoji":
+                image_segment = self._build_media_segment(
+                    "image",
+                    item,
+                    {
+                        "subType": 1,
+                        "summary": "[动画表情]",
+                    },
+                )
+                if image_segment:
+                    outbound_items.append({"kind": "segment", "payload": image_segment})
+                continue
+
+            if item_type == "voice":
+                voice_segment = self._build_media_segment("record", item)
+                if voice_segment:
+                    outbound_items.append({"kind": "segment", "payload": voice_segment})
+                continue
+
+            if item_type == "video":
+                video_segment = self._build_media_segment("video", item)
+                if video_segment:
+                    outbound_items.append({"kind": "segment", "payload": video_segment})
+                continue
+
+            if item_type == "videourl":
+                video_segment = self._build_url_media_segment("video", item_data)
+                if video_segment:
+                    outbound_items.append({"kind": "segment", "payload": video_segment})
+                continue
+
+            if item_type == "file":
+                file_payload = self._build_file_upload_payload(item_data)
+                if not file_payload:
+                    binary_base64 = str(item.get("binary_data_base64") or "").strip()
+                    if binary_base64:
+                        file_payload = {"file": f"base64://{binary_base64}"}
+                if file_payload:
+                    outbound_items.append({"kind": "file", "payload": file_payload})
+                continue
+
+            if item_type == "dict" and isinstance(item_data, Mapping):
+                file_payload = self._build_dict_component_file_upload_payload(item_data)
+                if file_payload:
+                    outbound_items.append({"kind": "file", "payload": file_payload})
+                    continue
+                dict_segment = self._build_dict_component_segment(item_data)
+                if dict_segment:
+                    outbound_items.append({"kind": "segment", "payload": dict_segment})
+                continue
+
+            self.ctx.logger.debug(f"SnowLuma 跳过无法转换的出站消息段: type={item_type or 'unknown'}")
+        return outbound_items
+
+    @staticmethod
+    def _build_media_segment(
+        segment_type: str,
+        item: Mapping[str, Any],
+        extra_data: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """构造 OneBot 媒体消息段。"""
+
+        segment_data: Dict[str, Any] = {}
+        if extra_data:
+            segment_data.update(extra_data)
+
+        binary_base64 = str(item.get("binary_data_base64") or "").strip()
+        if binary_base64:
+            segment_data["file"] = f"base64://{binary_base64}"
+            return {"type": segment_type, "data": segment_data}
+
+        item_data = item.get("data")
+        file_reference = ""
+        if isinstance(item_data, Mapping):
+            file_reference = str(
+                item_data.get("file") or item_data.get("url") or item_data.get("path") or item_data.get("media") or ""
+            ).strip()
+        else:
+            file_reference = str(item_data or "").strip()
+
+        if not file_reference:
+            return None
+
+        if not file_reference.startswith(("base64://", "file://", "http://", "https://")):
+            file_reference = f"file://{file_reference}"
+        segment_data["file"] = file_reference
+        return {"type": segment_type, "data": segment_data}
+
+    @staticmethod
+    def _build_url_media_segment(segment_type: str, item_data: Any) -> Optional[Dict[str, Any]]:
+        """构造 OneBot 媒体引用消息段。"""
+
+        file_reference = ""
+        if isinstance(item_data, Mapping):
+            file_reference = str(
+                item_data.get("file") or item_data.get("url") or item_data.get("path") or item_data.get("media") or ""
+            ).strip()
+        else:
+            file_reference = str(item_data or "").strip()
+
+        if not file_reference:
+            return None
+
+        if not file_reference.startswith(("base64://", "file://", "http://", "https://")):
+            file_reference = f"file://{file_reference}"
+        return {"type": segment_type, "data": {"file": file_reference}}
+
+    @staticmethod
+    def _build_file_upload_payload(item_data: Any) -> Optional[Dict[str, Any]]:
+        """构造 SnowLuma 文件上传动作参数。"""
+
+        if isinstance(item_data, str):
+            file_reference = item_data.strip()
+            if not file_reference:
+                return None
+            return {"file": file_reference}
+
+        if not isinstance(item_data, Mapping):
+            return None
+
+        file_reference = str(item_data.get("file") or item_data.get("path") or item_data.get("url") or "").strip()
+        if not file_reference:
+            return None
+
+        payload: Dict[str, Any] = {"file": file_reference}
+        file_name = str(
+            item_data.get("name") or item_data.get("filename") or item_data.get("file_name") or ""
+        ).strip()
+        if file_name:
+            payload["name"] = file_name
+
+        folder = str(item_data.get("folder") or "").strip()
+        if folder:
+            payload["folder"] = folder
+
+        folder_id = str(item_data.get("folder_id") or "").strip()
+        if folder_id:
+            payload["folder_id"] = folder_id
+
+        upload_file = item_data.get("upload_file")
+        if isinstance(upload_file, bool):
+            payload["upload_file"] = upload_file
+        return payload
+
+    @classmethod
+    def _build_dict_component_file_upload_payload(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """从 ``DictComponent`` 提取文件上传动作参数。"""
+
+        raw_type = str(item_data.get("type") or "").strip()
+        if raw_type != "file":
+            return None
+        return cls._build_file_upload_payload(item_data.get("data", item_data))
+
+    @classmethod
+    def _build_dict_component_segment(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """构造 ``DictComponent`` 消息段。"""
+
+        raw_type = str(item_data.get("type") or "").strip()
+        raw_payload = item_data.get("data", item_data)
+        if raw_type == "video":
+            if isinstance(raw_payload, Mapping):
+                binary_base64 = str(raw_payload.get("binary_data_base64") or "").strip()
+                if binary_base64:
+                    return {"type": "video", "data": {"file": f"base64://{binary_base64}"}}
+            return cls._build_url_media_segment("video", raw_payload)
+        if raw_type == "videourl":
+            return cls._build_url_media_segment("video", raw_payload)
+        return None
+
+    @classmethod
+    def _dump_debug_payload(cls, payload: Any) -> str:
+        """序列化调试载荷，并缩略日志中的大块媒体 Base64。"""
+
+        compacted_payload = cls._compact_debug_payload(payload)
+        return json.dumps(compacted_payload, ensure_ascii=False, default=str)
+
+    @classmethod
+    def _compact_debug_payload(cls, payload: Any, *, field_name: str = "") -> Any:
+        """递归缩略调试载荷中的媒体 Base64，避免日志被图片内容刷屏。"""
+
+        if isinstance(payload, Mapping):
+            return {
+                key: cls._compact_debug_payload(value, field_name=str(key))
+                for key, value in payload.items()
+            }
+
+        if isinstance(payload, list):
+            return [cls._compact_debug_payload(item, field_name=field_name) for item in payload]
+
+        if isinstance(payload, str):
+            return cls._compact_debug_string(payload, field_name=field_name)
+
+        return payload
+
+    @classmethod
+    def _compact_debug_string(cls, value: str, *, field_name: str = "") -> str:
+        """缩略单个字符串字段中的 Base64 内容。"""
+
+        normalized_value = value.strip()
+        if normalized_value.startswith("base64://"):
+            return "base64://" + cls._compact_base64_text(normalized_value.removeprefix("base64://"))
+
+        data_url_marker = ";base64,"
+        if normalized_value.startswith("data:") and data_url_marker in normalized_value:
+            prefix, raw_base64 = normalized_value.split(data_url_marker, maxsplit=1)
+            return f"{prefix}{data_url_marker}{cls._compact_base64_text(raw_base64)}"
+
+        media_field_names = {"base64", "binary_data_base64", "image_base64", "emoji_base64", "audio_base64"}
+        if field_name in media_field_names:
+            return cls._compact_base64_text(normalized_value)
+
+        return value
+
+    @staticmethod
+    def _compact_base64_text(raw_base64: str, *, head_length: int = 48, tail_length: int = 16) -> str:
+        """保留 Base64 头尾与长度，隐藏中间的大块内容。"""
+
+        if len(raw_base64) <= head_length + tail_length + 32:
+            return raw_base64
+
+        head = raw_base64[:head_length]
+        tail = raw_base64[-tail_length:]
+        return f"{head}...<base64省略 chars={len(raw_base64)}>...{tail}"
+
+    @staticmethod
+    def _normalize_outbound_reply_id(message_id: str) -> Optional[str]:
+        """把内部回复目标 ID 转成 SnowLuma 可接受的 OneBot 消息 ID。"""
+
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id or normalized_message_id.startswith("snowluma-"):
+            return None
+
+        try:
+            reply_id = int(normalized_message_id)
+        except ValueError:
+            return None
+
+        if reply_id == 0:
+            return None
+        return normalized_message_id
+
+    @staticmethod
+    def _encode_binary(binary_data: bytes) -> str:
+        """保留给后续二进制媒体扩展使用。"""
+
+        return base64.b64encode(binary_data).decode("utf-8")
+
+    @staticmethod
+    def _hash_binary(binary_data: bytes) -> str:
+        """保留给后续二进制媒体扩展使用。"""
+
+        return hashlib.sha256(binary_data).hexdigest()
+
