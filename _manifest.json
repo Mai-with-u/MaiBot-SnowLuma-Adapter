@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "0.8.2",
+  "version": "0.8.3",
   "name": "SnowLuma 连接器（适配器）/ SnowLuma Adapter",
   "description": "连接SnowLuma的Maibot连接器/SnowLuma WebSocket adapter plugin for MaiBot message gateway.",
   "author": {
@@ -23,7 +23,7 @@
   },
   "host_application": {
     "min_version": "1.0.6",
-    "max_version": "1.0.99"
+    "max_version": "1.1.99"
   },
   "sdk": {
     "min_version": "2.5.0",
