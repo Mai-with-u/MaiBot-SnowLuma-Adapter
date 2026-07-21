@@ -7,7 +7,7 @@ from shutil import which
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 from uuid import uuid4
 
-from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType
+from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsgType, WSServerHandshakeError
 from maibot_sdk import API, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
@@ -27,6 +27,11 @@ from .settings import (
 from ..qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
 
 OutboundAction = Tuple[str, Dict[str, Any]]
+TOKEN_ERROR_MESSAGE = "token不正确，请在 snowluma适配器中设置与snowluma webui中一致的token"
+
+
+class SnowLumaTokenError(RuntimeError):
+    """SnowLuma token 配置不正确。"""
 
 
 class SnowLumaAdapterPlugin(MaiBotPlugin):
@@ -895,15 +900,34 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         while self._stop_event is not None and not self._stop_event.is_set():
             settings = self._load_settings()
+            listen_task: Optional[asyncio.Task[None]] = None
             try:
                 await self._connect(settings)
+                listen_task = asyncio.create_task(self._listen(), name="snowluma-adapter-listen")
+                await self._verify_connection(listen_task)
                 await self._bootstrap_runtime_state(settings)
-                await self._listen()
+                self.ctx.logger.info(
+                    f"SnowLuma WebSocket 已连接: ws://{settings.luma_client.server}:{settings.luma_client.port}"
+                )
+                await listen_task
             except asyncio.CancelledError:
                 raise
+            except SnowLumaTokenError:
+                self.ctx.logger.warning(TOKEN_ERROR_MESSAGE)
+            except WSServerHandshakeError as exc:
+                if exc.status in {401, 403}:
+                    self.ctx.logger.warning(TOKEN_ERROR_MESSAGE)
+                else:
+                    self.ctx.logger.warning(f"SnowLuma 连接异常，稍后重试: {exc}")
             except Exception as exc:
                 self.ctx.logger.warning(f"SnowLuma 连接异常，稍后重试: {exc}")
             finally:
+                if listen_task is not None and not listen_task.done():
+                    listen_task.cancel()
+                    try:
+                        await listen_task
+                    except asyncio.CancelledError:
+                        pass
                 await self._disconnect()
                 await self._report_gateway_ready(False)
 
@@ -917,7 +941,27 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         timeout = ClientTimeout(total=10)
         self._session = ClientSession(timeout=timeout)
         self._ws = await self._session.ws_connect(settings.luma_client.build_ws_url())
-        self.ctx.logger.info(f"SnowLuma WebSocket 已连接: {settings.luma_client.build_ws_url()}")
+
+    async def _verify_connection(self, listen_task: asyncio.Task[None]) -> None:
+        """验证 SnowLuma token，并确保验证期间连接没有提前断开。"""
+
+        verify_task = asyncio.create_task(self._call_action("get_login_info", {}), name="snowluma-verify-token")
+        done, _ = await asyncio.wait({verify_task, listen_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if verify_task in done:
+            response = verify_task.result()
+            if response.get("retcode") in {1401, 401, 403}:
+                raise SnowLumaTokenError(TOKEN_ERROR_MESSAGE)
+            if error_message := self._extract_action_error(response):
+                raise RuntimeError(f"SnowLuma 连接验证失败: {error_message}")
+            return
+
+        verify_task.cancel()
+        try:
+            await verify_task
+        except asyncio.CancelledError:
+            pass
+        raise SnowLumaTokenError(TOKEN_ERROR_MESSAGE)
 
     async def _disconnect(self) -> None:
         """关闭 WebSocket 和未完成动作。"""
