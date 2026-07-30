@@ -282,7 +282,7 @@ class SnowLumaChatSection(PluginConfigBase):
         },
     )
     show_dropped_chat_list_messages: bool = Field(
-        default=False,
+        default=True,
         description="是否展示未通过聊天名单过滤而被丢弃的消息。",
         json_schema_extra={
             "hint": "关闭后不记录群聊/私聊名单丢弃日志，默认关闭以减少刷屏。",
