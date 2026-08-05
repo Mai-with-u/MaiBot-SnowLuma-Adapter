@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from io import BytesIO
 from pathlib import Path
-from shutil import which
+from shutil import copy2, which
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 from uuid import uuid4
 
@@ -12,6 +12,7 @@ from maibot_sdk import API, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 import asyncio
+import os
 import base64
 import hashlib
 import json
@@ -27,6 +28,10 @@ from .settings import (
 from ..qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
 
 OutboundAction = Tuple[str, Dict[str, Any]]
+FILE_UPLOAD_ACTION_TIMEOUT_SEC = 600.0
+# Docker 部署时：宿主机暂存目录 -> 容器内路径（可用环境变量覆盖）
+DEFAULT_SNOWLUMA_HOST_UPLOAD_DIR = "/vol1/docker/volumes/s_snowluma-data/_data/maibot_uploads"
+DEFAULT_SNOWLUMA_CONTAINER_UPLOAD_DIR = "/app/snowluma-data/maibot_uploads"
 TOKEN_ERROR_MESSAGE = "token不正确，请在 snowluma适配器中设置与snowluma webui中一致的token"
 
 
@@ -1070,7 +1075,12 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if future is not None and not future.done():
             future.set_result(payload)
 
-    async def _call_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _call_action(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        timeout_sec: float | None = None,
+    ) -> Dict[str, Any]:
         """调用 SnowLuma OneBot 风格动作接口。"""
 
         if self._ws is None:
@@ -1083,10 +1093,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         payload = {"action": action, "params": params, "echo": echo}
         await self._ws.send_str(json.dumps(payload, ensure_ascii=False))
-        try:
-            return await asyncio.wait_for(future, timeout=max(1.0, settings.luma_client.action_timeout_sec))
-        except asyncio.TimeoutError as exc:
+        if timeout_sec is not None:
+            timeout_seconds = max(1.0, float(timeout_sec))
+        elif str(action or "").startswith(("upload_group_file", "upload_private_file")):
+            timeout_seconds = max(1.0, FILE_UPLOAD_ACTION_TIMEOUT_SEC)
+        else:
             timeout_seconds = max(1.0, settings.luma_client.action_timeout_sec)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
             self.ctx.logger.warning(
                 "SnowLuma action 等待响应超时，准备断开旧连接并触发重连: action=%s timeout=%.1fs",
                 action,
@@ -3088,15 +3103,15 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             file_reference = f"file://{file_reference}"
         return {"type": segment_type, "data": {"file": file_reference}}
 
-    @staticmethod
-    def _build_file_upload_payload(item_data: Any) -> Optional[Dict[str, Any]]:
-        """构造 SnowLuma 文件上传动作参数。"""
+    def _build_file_upload_payload(self, item_data: Any) -> Optional[Dict[str, Any]]:
+        """构造 SnowLuma 文件上传动作参数；Docker 部署时自动暂存到容器可见目录。"""
 
         if isinstance(item_data, str):
             file_reference = item_data.strip()
             if not file_reference:
                 return None
-            return {"file": file_reference}
+            staged = self._stage_local_file_for_snowluma(file_reference, "")
+            return {"file": staged or file_reference}
 
         if not isinstance(item_data, Mapping):
             return None
@@ -3105,10 +3120,11 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         if not file_reference:
             return None
 
-        payload: Dict[str, Any] = {"file": file_reference}
         file_name = str(
             item_data.get("name") or item_data.get("filename") or item_data.get("file_name") or ""
         ).strip()
+        staged = self._stage_local_file_for_snowluma(file_reference, file_name)
+        payload: Dict[str, Any] = {"file": staged or file_reference}
         if file_name:
             payload["name"] = file_name
 
@@ -3125,14 +3141,53 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             payload["upload_file"] = upload_file
         return payload
 
-    @classmethod
-    def _build_dict_component_file_upload_payload(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    def _stage_local_file_for_snowluma(self, file_reference: str, file_name: str = "") -> str:
+        """若文件在宿主机本地且配置了共享卷，则复制到 SnowLuma 容器可见路径。"""
+
+        raw = str(file_reference or "").strip()
+        if not raw or raw.startswith(("http://", "https://", "base64://")):
+            return ""
+
+        host_path_text = raw[7:] if raw.startswith("file://") else raw
+        host_path = Path(host_path_text)
+        if not host_path.is_file():
+            return ""
+
+        host_dir = Path(
+            os.environ.get("SNOWLUMA_HOST_UPLOAD_DIR") or DEFAULT_SNOWLUMA_HOST_UPLOAD_DIR
+        )
+        container_dir = (
+            os.environ.get("SNOWLUMA_CONTAINER_UPLOAD_DIR") or DEFAULT_SNOWLUMA_CONTAINER_UPLOAD_DIR
+        ).rstrip("/")
+        # 未配置或目录不可用时，保持原路径（非 Docker / 同机可见）
+        try:
+            host_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.ctx.logger.warning(f"SnowLuma 文件暂存目录不可用，回退原路径: {exc}")
+            return raw if raw.startswith("file://") else f"file://{host_path}"
+
+        safe_name = Path(file_name or host_path.name).name or host_path.name
+        staged_name = f"{uuid4().hex[:10]}_{safe_name}"
+        staged_host = host_dir / staged_name
+        try:
+            copy2(str(host_path), str(staged_host))
+        except Exception as exc:
+            self.ctx.logger.warning(f"SnowLuma 文件暂存失败，回退原路径: {exc}")
+            return raw if raw.startswith("file://") else f"file://{host_path}"
+
+        container_path = f"{container_dir}/{staged_name}"
+        self.ctx.logger.info(
+            f"SnowLuma 文件已暂存: host={staged_host} container={container_path}"
+        )
+        return container_path
+
+    def _build_dict_component_file_upload_payload(self, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """从 ``DictComponent`` 提取文件上传动作参数。"""
 
         raw_type = str(item_data.get("type") or "").strip()
         if raw_type != "file":
             return None
-        return cls._build_file_upload_payload(item_data.get("data", item_data))
+        return self._build_file_upload_payload(item_data.get("data", item_data))
 
     @classmethod
     def _build_dict_component_segment(cls, item_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:

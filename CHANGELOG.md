@@ -2,6 +2,11 @@
 
 
 
+## [0.8.5]
+
+- 文件上传支持 Docker 共享卷暂存（`SNOWLUMA_HOST_UPLOAD_DIR` / `SNOWLUMA_CONTAINER_UPLOAD_DIR`）
+- 延长 `upload_group_file` / `upload_private_file` 默认超时，避免大文件上传失败
+
 ## [0.8.4]
 
 - 支持1.1.0版本
