@@ -14,9 +14,9 @@
     "documentation": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter",
     "issues": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter/issues"
   },
-  "plugin_type":"adapter",
+  "plugin_type": "adapter",
   "display": {
-    "icon":{
+    "icon": {
       "type": "local",
       "value": "assets/icon.jpg"
     }
