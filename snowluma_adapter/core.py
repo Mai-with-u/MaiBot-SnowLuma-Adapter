@@ -983,7 +983,11 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     async def _bootstrap_runtime_state(self, settings: SnowLumaAdapterSettings) -> None:
         """连接建立后激活消息网关路由。"""
 
-        await self._report_gateway_ready(True, settings=settings)
+        while True:
+            account_id = self._connected_account_id
+            await self._report_gateway_ready(True, account_id=account_id, settings=settings)
+            if account_id == self._connected_account_id:
+                break
 
     async def _report_gateway_ready(
         self,

@@ -7,7 +7,7 @@ from maibot_sdk import Field, PluginConfigBase
 from pydantic import field_validator
 
 SNOWLUMA_GATEWAY_NAME = "snowluma_gateway"
-SUPPORTED_CONFIG_VERSION = "1.0.5"
+SUPPORTED_CONFIG_VERSION = "1.0.6"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
 VOICE_TRANSCODE_SAMPLE_RATE = 24000
