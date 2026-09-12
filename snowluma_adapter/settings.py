@@ -11,7 +11,13 @@ SUPPORTED_CONFIG_VERSION = "1.0.6"
 DEFAULT_CHAT_LIST_TYPE = "whitelist"
 PRIVATE_CHAT_TOOL_BYPASS_SECONDS = 15 * 60
 VOICE_TRANSCODE_SAMPLE_RATE = 24000
-VOICE_TRANSCODE_TIMEOUT_SECONDS = 15.0
+# 本地兜底转码的单阶段超时（Silk 解码与 ffmpeg 各自限时，最坏情况会叠加）。
+# 高负载机器上 15s 容易误杀；正常路径已优先使用 SnowLuma 服务端返回的 base64。
+VOICE_TRANSCODE_TIMEOUT_SECONDS = 30.0
+# 单个动作响应允许内联解码的最大字节数；超过则跳过内联数据，避免异常大响应直接进内存。
+VOICE_INLINE_MAX_BYTES = 16 * 1024 * 1024
+# Silk 解码专用线程池大小；解码线程无法取消，隔离在独立线程池内避免拖累默认线程池。
+VOICE_DECODE_MAX_WORKERS = 2
 
 
 def _schema_i18n(
