@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from io import BytesIO
 from pathlib import Path
@@ -20,6 +21,8 @@ import time
 from .settings import (
     PRIVATE_CHAT_TOOL_BYPASS_SECONDS,
     SNOWLUMA_GATEWAY_NAME,
+    VOICE_DECODE_MAX_WORKERS,
+    VOICE_INLINE_MAX_BYTES,
     VOICE_TRANSCODE_SAMPLE_RATE,
     VOICE_TRANSCODE_TIMEOUT_SECONDS,
     SnowLumaAdapterSettings,
@@ -52,6 +55,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         self._group_name_cache: Dict[str, str] = {}
         self._group_member_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._private_chat_bypass_expires_at: Dict[str, float] = {}
+        self._voice_decode_executor: Optional[ThreadPoolExecutor] = None
 
     async def on_load(self) -> None:
         """插件加载后按配置启动连接。"""
@@ -60,9 +64,10 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
-        """插件卸载前关闭连接。"""
+        """插件卸载前关闭连接与专用解码线程池。"""
 
         await self._stop_connection()
+        await self._shutdown_voice_decode_executor()
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         """配置更新后重启连接。"""
@@ -2580,6 +2585,9 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
             if binary_data:
                 return binary_data
 
+        # 语音在上方已经走过一次 get_record，不再重试，避免服务端重复转码与重复告警。
+        if segment_type == "voice":
+            return b""
         return await self._load_binary_from_onebot_action(segment_type, segment_data)
 
     async def _load_binary_from_onebot_action(self, segment_type: str, segment_data: Mapping[str, Any]) -> bytes:
@@ -2632,7 +2640,7 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 f"response={json.dumps(response, ensure_ascii=False, default=str)}"
             )
 
-        binary_data = await self._extract_binary_from_action_response(response)
+        binary_data = await self._extract_binary_from_action_response(response, prefer_inline_base64=True)
         if binary_data:
             if self._is_silk_voice_binary(binary_data):
                 response_data = response.get("data", {})
@@ -2641,18 +2649,51 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 returned_file = str(response_data.get("file") or "")[:120]
                 returned_file_name = str(response_data.get("file_name") or "")
                 self.ctx.logger.debug(
-                    "SnowLuma get_record 返回的媒体仍是 Silk 原始数据: "
+                    "SnowLuma get_record 响应内容仍是 Silk 原始数据，将尝试本地转码: "
                     f"params={params} file_name={returned_file_name!r} file={returned_file!r}"
                 )
             return binary_data
+
+        # get_record 明确失败时把服务端原因暴露出来，避免只剩“降级为文本占位”的笼统结论。
+        action_error = self._extract_action_error(response)
+        if action_error:
+            self.ctx.logger.warning(f"SnowLuma get_record 失败: {action_error}")
         return b""
 
-    async def _extract_binary_from_action_response(self, response: Mapping[str, Any]) -> bytes:
-        """从 OneBot 动作响应中提取二进制媒体内容。"""
+    async def _extract_binary_from_action_response(
+        self,
+        response: Mapping[str, Any],
+        *,
+        prefer_inline_base64: bool = False,
+    ) -> bytes:
+        """从 OneBot 动作响应中提取二进制媒体内容。
+
+        prefer_inline_base64 为 True 时优先使用响应内联的 base64，
+        目前仅用于 get_record 的 out_format 服务端转码结果。
+        """
 
         response_data = response.get("data", response)
         if not isinstance(response_data, Mapping):
             return b""
+
+        if prefer_inline_base64:
+            # SnowLuma 的 get_record(out_format=...) 会把服务端转码结果放在 base64，
+            # 而 data.file 仍是原始 SILK 的下载地址；优先取 base64 可避免重复下载原始语音
+            # 并退回本地转码（负载高时极易超时降级为文本占位）。
+            inline_base64 = "".join(str(response_data.get("base64") or "").split())
+            if inline_base64.startswith("base64://"):
+                inline_base64 = inline_base64.removeprefix("base64://")
+            if inline_base64:
+                estimated_bytes = len(inline_base64) * 3 // 4
+                if estimated_bytes > VOICE_INLINE_MAX_BYTES:
+                    self.ctx.logger.warning(
+                        f"SnowLuma 动作响应 base64 过大，跳过内联数据: {estimated_bytes} bytes"
+                    )
+                else:
+                    try:
+                        return base64.b64decode(inline_base64, validate=True)
+                    except Exception as exc:
+                        self.ctx.logger.warning(f"SnowLuma 动作响应 base64 解码失败，回退文件下载: {exc}")
 
         return await self._load_binary_reference(str(response_data.get("file") or ""))
 
@@ -2669,14 +2710,63 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
     def _is_silk_voice_binary(binary_data: bytes) -> bool:
         """判断语音数据是否仍是 QQ Silk，避免误作为通用音频送入 ASR。"""
 
-        return binary_data.startswith(b"#!SILK_V3") or binary_data.startswith(b"\x02#!SILK_V3")
+        # 0x03 前缀是 QQ AI 语音使用的容器变体，解码阶段会归一化为 0x02；
+        # 本地兜底必须同样识别，否则会把原始 Silk 当成通用音频直接送进 ASR。
+        return (
+            binary_data.startswith(b"#!SILK_V3")
+            or binary_data.startswith(b"\x02#!SILK_V3")
+            or binary_data.startswith(b"\x03#!SILK_V3")
+        )
+
+    def _get_voice_decode_executor(self) -> ThreadPoolExecutor:
+        """取得（必要时重建）专用的 Silk 解码线程池。
+
+        解码线程无法被取消，放在默认线程池里会拖累插件内其它 to_thread 任务；
+        这里用独立线程池隔离，并限制并发数。
+        """
+
+        if self._voice_decode_executor is None:
+            self._voice_decode_executor = ThreadPoolExecutor(
+                max_workers=VOICE_DECODE_MAX_WORKERS,
+                thread_name_prefix="snowluma-silk",
+            )
+        return self._voice_decode_executor
+
+    async def _shutdown_voice_decode_executor(self) -> None:
+        """关闭专用解码线程池；已在执行的解码线程无法取消，只能等其自然结束。"""
+
+        executor = self._voice_decode_executor
+        if executor is None:
+            return
+        self._voice_decode_executor = None
+        executor.shutdown(wait=False, cancel_futures=True)
 
     async def _transcode_silk_voice_binary(self, silk_binary: bytes) -> bytes:
         """把 QQ Silk 语音转成 ASR 更容易识别的 MP3。"""
 
-        pcm_binary = await asyncio.to_thread(self._decode_silk_to_pcm_sync, silk_binary)
-        if not pcm_binary:
+        # Silk 解码阶段同样需要限时；此前该阶段没有超时保护，
+        # 解码卡住时整条入站消息会一直等待（不会走到 ffmpeg）。
+        # 解码放在专用线程池里，超时后不会被取消的线程也不影响默认线程池。
+        try:
+            pcm_binary = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    self._get_voice_decode_executor(),
+                    self._decode_silk_to_pcm_sync,
+                    silk_binary,
+                ),
+                timeout=VOICE_TRANSCODE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 解码超时（解码线程仍在专用线程池中继续）")
+            return b""
+        except ModuleNotFoundError:
             self.ctx.logger.warning("SnowLuma 本地 Silk 解码失败：请安装插件依赖 silk-python")
+            return b""
+        except Exception as exc:
+            self.ctx.logger.error(f"SnowLuma 本地 Silk 解码失败: {type(exc).__name__}: {exc}")
+            return b""
+        if not pcm_binary:
+            self.ctx.logger.warning("SnowLuma 本地 Silk 解码结果为空")
             return b""
 
         ffmpeg_path = which("ffmpeg")
@@ -2711,10 +2801,13 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
                 timeout=VOICE_TRANSCODE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            self.ctx.logger.warning("SnowLuma 本地 Silk 转 MP3 超时")
+            await self._terminate_process(process)
+            self.ctx.logger.warning(f"SnowLuma 本地 Silk 转 MP3 超时（>{VOICE_TRANSCODE_TIMEOUT_SECONDS:.0f}s）")
             return b""
+        except BaseException:
+            # 任务被取消等异常同样要回收子进程，避免留下孤儿 ffmpeg。
+            await self._terminate_process(process)
+            raise
 
         if process.returncode != 0:
             stderr_text = stderr_binary.decode("utf-8", errors="ignore").strip()
@@ -2727,20 +2820,34 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
         return mp3_binary
 
     @staticmethod
+    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+        """回收 ffmpeg 子进程，避免超时或任务取消时留下孤儿进程。"""
+
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+
+    @staticmethod
     def _decode_silk_to_pcm_sync(silk_binary: bytes) -> bytes:
         """用 silk-python 解码 QQ Silk，返回 s16le PCM。"""
 
-        try:
-            pysilk = import_module("pysilk")
-        except ImportError:
-            return b""
+        pysilk = import_module("pysilk")
+
+        # pysilk 只接受 "#!SILK_V3" 与 "\x02#!SILK_V3" 两种头；
+        # 0x03 是 QQ AI 语音的容器变体，与 SnowLuma 服务端一致，解码前归一化首字节。
+        if (
+            len(silk_binary) > len(b"#!SILK_V3")
+            and silk_binary[0] == 0x03
+            and silk_binary[1 : 1 + len(b"#!SILK_V3")] == b"#!SILK_V3"
+        ):
+            silk_binary = b"\x02" + silk_binary[1:]
 
         silk_buffer = BytesIO(silk_binary)
         pcm_buffer = BytesIO()
-        try:
-            pysilk.decode(silk_buffer, pcm_buffer, VOICE_TRANSCODE_SAMPLE_RATE)
-        except Exception:
-            return b""
+        pysilk.decode(silk_buffer, pcm_buffer, VOICE_TRANSCODE_SAMPLE_RATE)
         return pcm_buffer.getvalue()
 
     @staticmethod
