@@ -142,6 +142,19 @@ class SnowLumaAdapterPlugin(MaiBotPlugin):
 
         return await self._call_action(action, self._api_params(kwargs))
 
+    @API("adapter.napcat.action.call", description="调用任意 OneBot 动作", version="1", public=True)
+    async def api_call_action(self, action_name: str = "", params: Any = None) -> Dict[str, Any]:
+        """调用任意 OneBot 动作（兼容 NapCat 的 ``adapter.napcat.action.call``）。
+
+        下游 napcat 风格插件（如 friend-request-handler）通过该入口透传
+        ``action_name`` / ``params`` 到 SnowLuma，无需插件改造即可复用。
+        """
+
+        action = str(action_name or "").strip()
+        if not action:
+            raise ValueError("action_name 不能为空")
+        return await self._call_passthrough_action(action, {"params": params})
+
     @API("adapter.napcat.account.get_friend_list", description="获取好友列表", version="1", public=True)
     async def api_get_friend_list(self, **kwargs: Any) -> Dict[str, Any]:
         """获取好友列表。"""
