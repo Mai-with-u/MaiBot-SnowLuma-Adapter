@@ -1,60 +1,43 @@
 # Changelog
 
-## [0.9.0]
+## [1.0.0] — 合并版：统一 QQ 连接器
 
-- 最低支持版本调整为 MaiBot 1.2.0，不再兼容更早的本体版本。
-- 保持默认启用适配器本地群聊、私聊白名单，避免升级改变既有访问范围。
-- 支持通过 MaiBot 的适配器管理入口集中查看和编辑 SnowLuma 名单配置，为后续迁移到本体统一策略做准备。
-- 修复连接初始化时空账号状态可能覆盖已识别账号，导致 MaiBot 将已连接适配器显示为离线的问题。
+以 NapCat 适配器的模块结构为基底，合并 SnowLuma 适配器的全部特性，
+形成同时支持 SnowLuma / NapCat 客户端的单一适配器插件。
+插件 ID 沿用 `maibot-team.snowluma-adapter`。
 
-## [0.8.5]
+### 主要功能
 
-- 支持 MaiBot 1.2.x。
+- client_type 三值配置（auto / napcat / snowluma）：auto 在每次连接建立后通过
+  `get_version_info` 自动判定对端并应用能力画像；显式取值时做一致性校验，
+  不一致打警告并按声明运行。
+- 运行时热切换：WebUI 修改 client_type 或连接参数后自动断开重连并应用新画像。
+- 统一 API 命名空间 `adapter.napcat.*`：171 个公开 API（NapCat 164 + SnowLuma QZone 7），
+  QZone API 按画像能力位校验，napcat 下调用显式报错。
+- 出站动作列表模型：SnowLuma 画像把文件段拆为独立 upload 动作并保持顺序，
+  NapCat 画像保持内联 file 段；合并转发参数键按画像取 message / messages。
+- 出站 token 双通道鉴权：同时附带 Bearer 头与 URL access_token 参数，兼容两类服务端。
+- 富文本通知（SnowLuma 风格）：操作者真名解析（带缓存）、poke raw_info 动作文、
+  invite / kick / kick_me 区分、精华增删区分、消息 ID 后缀；
+  保留 NapCat 的全体禁言解除与自然解除分支、禁言状态跟踪（natural lift）与心跳监测。
 
-## [0.8.4]
+### 细节（修复与特性移植）
 
-- 支持1.1.0版本
-- 优化token错误的Log
+- 移植 silk 语音转码链（pysilk 解码 24kHz PCM → ffmpeg MP3），依赖缺失时明确警告并降级。
+- 移植 QQ 表情双模式解析（description / emoji，qq_face_parse_mode 配置项）。
+- 移植入站媒体取数链：base64:// 引用、本地路径、get_image 动作兜底。
+- 移植 Ada 原始报文调试日志与 base64 脱敏（独立 debug.py，两端通用）。
+- 移植 reply 空引用过滤（入站 id=0）与合成 ID 过滤（出站 qq- 前缀），两端启用。
+- 入站兼容 SnowLuma 的字符串 message 载荷与缺失 post_type 的推送（按消息路由）。
+- `is_picture` 改为动态判定（任意图片段即置位），不再恒为 False。
+- 聊天名单过滤默认关闭：入站通行统一交给宿主适配器策略（adapter_policy.toml / WebUI）；
+  插件侧过滤保留为可选项。
+- 配置迁移：旧 `[luma_client]` / `[napcat_server]` / `[connection]` 节自动迁移到 `[client]`
+  （host → server、access_token → token），旧版本号自动改写。
+- 旧 SnowLuma 适配器的私聊工具、通知开关、正则过滤（NapCat）等行为全部保留。
 
-## [0.8.2]
+## [0.x 历史]
 
-- 支持视频与文件上传发送
-
-## [0.8.1]
-
-- 修复发送的表情包变为图片的问题
-- 新增显示发送消息的详细信息调试选项
-
-## [0.8.0]
-
-### 用户感知功能
-
-- 补充群资料与群成员相关 NapCat 兼容 API：`adapter.napcat.group.get_group_list`、`adapter.napcat.group.get_group_info`、`adapter.napcat.group.get_group_member_list`。
-- 补充群管理相关 NapCat 兼容 API：`adapter.napcat.group.set_group_kick`、`adapter.napcat.group.set_group_card`、`adapter.napcat.group.set_group_name`。
-- 补充好友与陌生人信息相关 NapCat 兼容 API：`adapter.napcat.account.get_friend_list`、`adapter.napcat.account.get_stranger_info`。
-- 补充消息与互动相关 NapCat 兼容 API：`adapter.napcat.message.send_msg`、`adapter.napcat.message.get_forward_msg`、`adapter.napcat.message.send_poke`。
-- 补充文件与语音相关 NapCat 兼容 API：`adapter.napcat.file.get_record`、`adapter.napcat.file.get_group_file_url`、`adapter.napcat.file.upload_group_file`。
-- 补充图片 OCR 与点赞相关 NapCat 兼容 API：`adapter.napcat.account.ocr_image`、`adapter.napcat.account.send_like`、`adapter.napcat.account.get_profile_like`。
-- 补充个人资料、头像和状态相关 NapCat 兼容 API：`adapter.napcat.account.set_qq_profile`、`adapter.napcat.account.set_qq_avatar`、`adapter.napcat.account.set_self_longnick`、`adapter.napcat.account.set_diy_online_status`、`adapter.napcat.system.set_input_status`、`adapter.napcat.system.set_online_status`。
-- 新增 SnowLuma Qzone 能力的 NapCat 风格兼容入口：`adapter.napcat.qzone.get_qzone_msg_list`、`adapter.napcat.qzone.get_qzone_feeds`、`adapter.napcat.qzone.send_qzone_msg`、`adapter.napcat.qzone.delete_qzone_msg`、`adapter.napcat.qzone.like_qzone`、`adapter.napcat.qzone.unlike_qzone`、`adapter.napcat.qzone.comment_qzone`。
-
-
-## [0.7.2]
-
-### 用户感知功能
-
-- 修复表情包出站消息被 SnowLuma 按普通图片发送的问题，现在会按 OneBot 表情包 subtype 发送。
-
-## [0.7.1]
-
-### 用户感知功能
-
-- 支持通知信息获取。
-
-## [0.7.0]
-
-### 用户感知功能
-
-- 支持发送转发消息。
-- 支持撤回消息。
-- 兼容 NapCat 的一些接口。
+0.9.x 及更早版本的历史变更见上游仓库
+[Mai-with-u/MaiBot-SnowLuma-Adapter](https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter)
+与 [Mai-with-u/MaiBot-Napcat-Adapter](https://github.com/Mai-with-u/MaiBot-Napcat-Adapter)。

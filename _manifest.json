@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.9.0",
+  "version": "1.0.0",
   "name": "SnowLuma 连接器（适配器）/ SnowLuma Adapter",
-  "description": "连接SnowLuma的Maibot连接器/SnowLuma WebSocket adapter plugin for MaiBot message gateway.",
+  "description": "统一 QQ 连接器：以 OneBot v11 正向 WebSocket 同时支持 SnowLuma 与 NapCat 客户端，可自动判定对端类型并支持运行时热切换。",
   "author": {
     "name": "MaiBot Team",
     "url": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
@@ -14,9 +14,9 @@
     "documentation": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter",
     "issues": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter/issues"
   },
-  "plugin_type":"adapter",
+  "plugin_type": "adapter",
   "display": {
-    "icon":{
+    "icon": {
       "type": "local",
       "value": "assets/icon.jpg"
     }
@@ -45,7 +45,8 @@
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [
-      "zh-CN"
+      "zh-CN",
+      "en-US"
     ]
   },
   "id": "maibot-team.snowluma-adapter"
