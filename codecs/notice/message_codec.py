@@ -105,14 +105,11 @@ class QQNoticeCodec:
         Returns:
             Optional[str]: 若可以构造稳定去重键则返回该键，否则返回 ``None``。
         """
-        external_message_id = str(payload.get("message_id") or "").strip()
-        if external_message_id:
-            return external_message_id
-
         notice_type = str(payload.get("notice_type") or "").strip()
         if not notice_type:
             return None
 
+        # 撤回通知的 message_id 是被撤回消息的 ID，不能与普通消息共用去重键。
         sub_type = str(payload.get("sub_type") or "").strip()
         payload_digest = build_payload_digest(payload)
         suffix = f":{sub_type}" if sub_type else ""
