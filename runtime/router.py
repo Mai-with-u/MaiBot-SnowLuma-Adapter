@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Protocol
 
 import asyncio
 
-from ..codecs.notice.helpers import resolve_actor_user_id
 from ..config import QQPluginSettings
 from ..profile import PROFILE_BY_TYPE, probe_client_profile
 from ..types import QQPayloadDict
@@ -120,12 +119,10 @@ class QQEventRouter:
         group_id = str(payload.get("group_id") or "").strip()
         if self_id and sender_user_id == self_id and settings.filters.ignore_self_message:
             return
-        if not runtime.chat_filter.is_inbound_chat_allowed(sender_user_id, group_id, settings.chat):
-            return
         if await runtime.official_bot_guard.should_reject(
             sender_user_id=sender_user_id,
             group_id=group_id,
-            ban_qq_bot=settings.chat.ban_qq_bot,
+            ban_qq_bot=settings.filters.ban_qq_bot,
             payload=payload,
             sender=sender,
         ):
@@ -177,9 +174,6 @@ class QQEventRouter:
     ) -> None:
         """将单条通知载荷转换并注入 Host。
 
-        注入前按与普通消息一致的口径执行聊天名单过滤，
-        避免非名单内群聊/私聊的通知事件（如戳一戳）泄漏进 Host。
-
         Args:
             payload: OneBot 通知载荷。
             self_id: 当前机器人账号 ID。
@@ -194,14 +188,6 @@ class QQEventRouter:
             self._logger.debug(
                 f"通知事件未启用，已丢弃: {notice_type}.{sub_type or '<空>'}"
             )
-            return
-
-        group_id = str(payload.get("group_id") or "").strip()
-        actor_user_id = resolve_actor_user_id(payload)
-        # 群/私聊至少能确定其一时才做名单过滤；两者皆空的通知无法归类，保持放行
-        if (group_id or actor_user_id) and not runtime.chat_filter.is_inbound_chat_allowed(
-            actor_user_id, group_id, settings.chat
-        ):
             return
 
         message_dict = await runtime.notice_codec.build_notice_message_dict(payload)

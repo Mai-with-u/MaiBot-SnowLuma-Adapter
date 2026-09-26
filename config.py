@@ -2,7 +2,7 @@
 
 同一套配置同时支撑 SnowLuma 与 NapCat 两类客户端：
 [client].client_type 决定连接画像（auto 表示连接后自动判定），
-插件内的黑白名单默认关闭，入站过滤统一交给宿主 adapter_policy。
+插件不再内置黑白名单过滤，入站过滤统一交给宿主 adapter_policy。
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from pydantic import ValidationInfo, field_validator, model_validator
 
 from .constants import (
     DEFAULT_ACTION_TIMEOUT_SEC,
-    DEFAULT_CHAT_LIST_TYPE,
     DEFAULT_CLIENT_HOST,
     DEFAULT_CLIENT_PORT,
     DEFAULT_HEARTBEAT_INTERVAL_SEC,
@@ -103,17 +102,17 @@ class QQPluginOptions(PluginConfigBase):
         default=False,
         description="是否启用主动开启私聊工具。",
         json_schema_extra={
-            "hint": "开启后，模型可向指定 QQ 用户发送首条私聊消息；适配器侧过滤关闭时，宿主策略需另行放行该私聊。",
+            "hint": "开启后，模型可向指定 QQ 用户发送首条私聊消息；请在宿主适配器策略中放行该私聊。",
             "i18n": _schema_i18n(
                 label_en="Enable private chat tool",
                 label_ja="個人チャット開始ツールを有効化",
                 hint_en=(
                     "When enabled, the model can send the first private message to a user; "
-                    "with adapter-side filtering off, grant the chat in host adapter policy as well."
+                    "grant the chat in the host adapter policy."
                 ),
                 hint_ja=(
                     "有効にすると、モデルは指定ユーザーへ最初の個人メッセージを送信できます；"
-                    "アダプター側フィルターが無効の場合はホスト側ポリシーでの許可も必要です。"
+                    "ホスト側のアダプターポリシーでその個人チャットを許可してください。"
                 ),
             ),
             "label": "启用主动私聊工具",
@@ -457,186 +456,11 @@ class QQServerConfig(PluginConfigBase):
         return _normalize_positive_float(value, default_values[str(info.field_name)])
 
 
-class QQChatConfig(PluginConfigBase):
-    """聊天名单配置。
-
-    默认关闭：入站群聊/私聊过滤统一交给宿主 adapter_policy，
-    这里仅作为需要适配器侧兜底时的可选项保留。
-    """
-
-    __ui_label__: ClassVar[str] = "聊天过滤"
-    __ui_order__: ClassVar[int] = 2
-
-    enable_chat_list_filter: bool = Field(
-        default=False,
-        description="是否启用适配器侧群聊与私聊名单过滤（默认关闭，推荐使用宿主适配器策略）。",
-        json_schema_extra={
-            "hint": "默认关闭：请在 WebUI 的适配器策略中配置群聊/私聊通行规则。开启后本插件会在入站阶段按下方名单过滤。",
-            "i18n": _schema_i18n(
-                label_en="Enable chat list filter",
-                label_ja="チャットリストフィルターを有効化",
-                hint_en=(
-                    "Off by default: configure pass rules in the host adapter policy. "
-                    "When enabled, this plugin filters inbound messages by the lists below."
-                ),
-                hint_ja=(
-                    "既定ではオフ：通行ルールはホストのアダプターポリシーで設定してください。"
-                    "有効にすると、このプラグインが入站メッセージを下のリストでフィルターします。"
-                ),
-            ),
-            "label": "启用聊天名单过滤",
-            "order": 0,
-        },
-    )
-    show_dropped_chat_list_messages: bool = Field(
-        default=False,
-        description="是否显示未通过聊天名单过滤而被丢弃的消息日志。",
-        json_schema_extra={
-            "hint": "关闭后不会记录群聊/私聊因未通过聊天名单过滤而被丢弃的日志，默认关闭以减少刷屏。",
-            "i18n": _schema_i18n(
-                label_en="Show dropped chat-list logs",
-                label_ja="チャットリストで破棄されたログを表示",
-                hint_en="When disabled, dropped group/private chat-list logs are not recorded. Default off to reduce log noise.",
-                hint_ja="無効にすると、チャットリストで破棄されたグループ/個人チャットのログを記録しません。ログの増加を抑えるため既定ではオフです。",
-            ),
-            "label": "显示聊天名单丢弃日志",
-            "order": 1,
-        },
-    )
-    group_list_type: Literal["whitelist", "blacklist"] = Field(
-        default=DEFAULT_CHAT_LIST_TYPE,
-        description="群聊名单模式。",
-        json_schema_extra={
-            "hint": "白名单模式只接收列表内群聊，黑名单模式则忽略列表内群聊。",
-            "i18n": _schema_i18n(
-                label_en="Group list mode",
-                label_ja="グループリストモード",
-                hint_en="Whitelist mode only accepts listed groups; blacklist mode ignores listed groups.",
-                hint_ja="ホワイトリストではリスト内のグループのみ受信し、ブラックリストではリスト内のグループを無視します。",
-            ),
-            "label": "群聊名单模式",
-            "order": 2,
-        },
-    )
-    group_list: List[str] = Field(
-        default_factory=list,
-        description="群聊名单中的群号列表。",
-        json_schema_extra={
-            "hint": "群号会被统一转换为字符串并自动去重。",
-            "i18n": _schema_i18n(
-                label_en="Group list",
-                label_ja="グループリスト",
-                hint_en="Group IDs are normalized to strings and deduplicated automatically.",
-                hint_ja="グループ ID は文字列に正規化され、自動的に重複排除されます。",
-                placeholder_en="Enter group ID",
-                placeholder_ja="グループ ID を入力",
-            ),
-            "label": "群聊名单",
-            "order": 3,
-            "placeholder": "请输入群号",
-        },
-    )
-    private_list_type: Literal["whitelist", "blacklist"] = Field(
-        default=DEFAULT_CHAT_LIST_TYPE,
-        description="私聊名单模式。",
-        json_schema_extra={
-            "hint": "白名单模式只接收列表内私聊，黑名单模式则忽略列表内私聊。",
-            "i18n": _schema_i18n(
-                label_en="Private list mode",
-                label_ja="個人チャットリストモード",
-                hint_en="Whitelist mode only accepts listed private chats; blacklist mode ignores listed private chats.",
-                hint_ja="ホワイトリストではリスト内の個人チャットのみ受信し、ブラックリストではリスト内のグループを無視します。",
-            ),
-            "label": "私聊名单模式",
-            "order": 4,
-        },
-    )
-    private_list: List[str] = Field(
-        default_factory=list,
-        description="私聊名单中的用户 ID 列表。",
-        json_schema_extra={
-            "hint": "用户 ID 会被统一转换为字符串并自动去重。",
-            "i18n": _schema_i18n(
-                label_en="Private list",
-                label_ja="個人チャットリスト",
-                hint_en="User IDs are normalized to strings and deduplicated automatically.",
-                hint_ja="ユーザー ID は文字列に正規化され、自動的に重複排除されます。",
-                placeholder_en="Enter user ID",
-                placeholder_ja="グループ ID を入力",
-            ),
-            "label": "私聊名单",
-            "order": 5,
-            "placeholder": "请输入用户 ID",
-        },
-    )
-    ban_user_id: List[str] = Field(
-        default_factory=list,
-        description="全局屏蔽的用户 ID 列表。",
-        json_schema_extra={
-            "hint": "这些用户的消息会在进入 Host 之前被直接丢弃。",
-            "i18n": _schema_i18n(
-                label_en="Globally blocked users",
-                label_ja="全体ブロックユーザー",
-                hint_en="Messages from these users are dropped before entering the Host.",
-                hint_ja="これらのユーザーからのメッセージは Host に入る前に破棄されます。",
-                placeholder_en="Enter user ID",
-                placeholder_ja="グループ ID を入力",
-            ),
-            "label": "全局屏蔽用户",
-            "order": 6,
-            "placeholder": "请输入用户 ID",
-        },
-    )
-    ban_qq_bot: bool = Field(
-        default=False,
-        description="是否屏蔽 QQ 官方机器人消息。",
-        json_schema_extra={
-            "hint": "开启后会忽略来自 QQ 官方机器人或频道机器人的消息。",
-            "i18n": _schema_i18n(
-                label_en="Block official bots",
-                label_ja="公式 Bot をブロック",
-                hint_en="When enabled, messages from QQ official bots or channel bots are ignored.",
-                hint_ja="有効にすると、QQ 公式 Bot またはチャンネル Bot からのメッセージを無視します。",
-            ),
-            "label": "屏蔽官方机器人",
-            "order": 7,
-        },
-    )
-
-    @field_validator("group_list_type", "private_list_type", mode="before")
-    @classmethod
-    def _normalize_list_types(cls, value: Any) -> Literal["whitelist", "blacklist"]:
-        """规范化名单模式字段。
-
-        Args:
-            value: 原始配置值。
-
-        Returns:
-            Literal["whitelist", "blacklist"]: 合法的名单模式；非法时回退到默认值。
-        """
-
-        return _normalize_list_mode(value)
-
-    @field_validator("group_list", "private_list", "ban_user_id", mode="before")
-    @classmethod
-    def _normalize_id_lists(cls, value: Any) -> List[str]:
-        """规范化 ID 列表字段。
-
-        Args:
-            value: 原始配置值。
-
-        Returns:
-            List[str]: 规范化后的字符串列表，已去除空白与重复项。
-        """
-
-        return _normalize_string_list(value)
-
-
 class QQFilterConfig(PluginConfigBase):
     """消息过滤配置。"""
 
     __ui_label__: ClassVar[str] = "消息过滤"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 2
 
     ignore_self_message: bool = Field(
         default=True,
@@ -651,6 +475,21 @@ class QQFilterConfig(PluginConfigBase):
             ),
             "label": "忽略自身消息",
             "order": 0,
+        },
+    )
+    ban_qq_bot: bool = Field(
+        default=False,
+        description="是否屏蔽 QQ 官方机器人消息。",
+        json_schema_extra={
+            "hint": "开启后会忽略来自 QQ 官方机器人或频道机器人的消息。",
+            "i18n": _schema_i18n(
+                label_en="Block official bots",
+                label_ja="公式 Bot をブロック",
+                hint_en="When enabled, messages from QQ official bots or channel bots are ignored.",
+                hint_ja="有効にすると、QQ 公式 Bot またはチャンネル Bot からのメッセージを無視します。",
+            ),
+            "label": "屏蔽官方机器人",
+            "order": 5,
         },
     )
     regex_filter_enabled: bool = Field(
@@ -818,7 +657,6 @@ class QQPluginSettings(PluginConfigBase):
 
     plugin: QQPluginOptions = Field(default_factory=QQPluginOptions)
     client: QQServerConfig = Field(default_factory=QQServerConfig)
-    chat: QQChatConfig = Field(default_factory=QQChatConfig)
     notice: QQNoticeConfig = Field(default_factory=QQNoticeConfig)
     filters: QQFilterConfig = Field(default_factory=QQFilterConfig)
 
@@ -839,6 +677,8 @@ class QQPluginSettings(PluginConfigBase):
         chat_section = _as_mapping(raw_mapping.get("chat"))
         filters_section = _as_mapping(raw_mapping.get("filters"))
         notice_section = _as_mapping(raw_mapping.get("notice"))
+        if "ban_qq_bot" not in filters_section and "ban_qq_bot" in chat_section:
+            filters_section["ban_qq_bot"] = chat_section["ban_qq_bot"]
 
         client_section = _as_mapping(raw_mapping.get("client"))
         legacy_sources: List[tuple[str, Mapping[str, Any]]] = []
@@ -869,7 +709,6 @@ class QQPluginSettings(PluginConfigBase):
             plugin_section["config_version"] = SUPPORTED_CONFIG_VERSION
 
         return {
-            "chat": chat_section,
             "client": client_section,
             "filters": filters_section,
             "notice": notice_section,
@@ -943,24 +782,6 @@ def _as_mapping(value: Any) -> Dict[str, Any]:
     """
 
     return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _normalize_list_mode(value: Any) -> Literal["whitelist", "blacklist"]:
-    """规范化名单模式字符串。
-
-    Args:
-        value: 原始配置值。
-
-    Returns:
-        Literal["whitelist", "blacklist"]: 合法的名单模式；非法时回退到默认值。
-    """
-
-    normalized_value = _normalize_string(value)
-    if normalized_value == "whitelist":
-        return "whitelist"
-    if normalized_value == "blacklist":
-        return "blacklist"
-    return DEFAULT_CHAT_LIST_TYPE
 
 
 def _normalize_positive_float(value: Any, default: float) -> float:

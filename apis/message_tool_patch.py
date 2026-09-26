@@ -28,7 +28,7 @@ async def handle_find_user_qq_id(self: QQMessageApiMixin, msg_id: str = "", **kw
 
     del kwargs
 
-    normalized_msg_id = str(self._normalize_positive_int(msg_id, "msg_id"))
+    normalized_msg_id = str(self._normalize_message_id(msg_id, "msg_id"))
     message_detail = await self._require_query_service().get_message_detail(normalized_msg_id)
     if not isinstance(message_detail, dict):
         return {

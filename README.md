@@ -15,7 +15,7 @@
 - **运行时热切换**：在 WebUI 修改 `client_type` 或连接参数后，插件会自动断开重连并应用新画像。
 - **统一 API 命名空间**：`adapter.napcat.*` 共 171 个公开 API（含 SnowLuma 专属 QZone 组），
   QZone API 在 `client_type=napcat` 下调用会得到明确的「不支持」错误。
-- **名单默认交给宿主**：适配器侧群聊/私聊黑白名单默认关闭，
+- **名单交给宿主**：适配器不再内置群聊/私聊黑白名单和全局用户屏蔽名单，
   请在 WebUI 聊天页的「适配器策略」（`config/adapter_policy.toml`）中配置通行规则。
 - **SnowLuma 特性移植**：silk 语音转码（依赖 `silk-python` + ffmpeg）、QQ 表情双模式解析
   （description / emoji）、入站媒体 base64:// 与本地路径取数、Ada 原始报文调试日志、
@@ -26,13 +26,11 @@
 ## 从旧 SnowLuma 适配器（0.9.x）升级
 
 配置自动迁移：旧 `[luma_client]` 节会被读取并迁移到 `[client]`，旧版本号会自动改写。
-建议直接使用新的 `[client]` 节名。两处行为变化需要留意：
-
-1. **名单过滤默认关闭**：旧版的群聊/私聊白名单不再由插件执行，
-   请把名单迁到宿主适配器策略（WebUI 聊天页 → 适配器策略，按本插件维度配置
-   `default_action = "block"` + `allow_ids` 即可复刻白名单语义）。
-2. **`open_private_chat` 工具的 15 分钟放行**只作用于插件侧过滤；
-   名单过滤交给宿主后，还需在宿主策略中放行对应私聊。
+建议直接使用新的 `[client]` 节名。名单过滤现在由宿主适配器策略负责：
+旧 `[chat]` 的群聊/私聊黑白名单不再生效，请在 WebUI 聊天页的「适配器策略」中迁移群号、私聊用户 ID 规则。
+`ban_user_id` 也不再生效；宿主策略按聊天目标过滤，不能用来复刻群内按发送者 ID 的屏蔽。
+`open_private_chat` 不再提供 15 分钟适配器侧放行，需要接收该私聊的后续消息时，
+请在宿主策略中放行。旧 `[chat].ban_qq_bot` 会自动迁移到 `[filters].ban_qq_bot`。
 
 ## 从旧 NapCat 适配器迁移
 
@@ -40,7 +38,7 @@
 | --- | --- |
 | `plugin.*` | `plugin.*`（字段一致，新增表情模式与调试开关） |
 | `[napcat_server]` 节 | `[client]` 节（`host` → `server`，其余字段一致） |
-| `[chat]` / `[notice]` / `[filters]` | 同名节，字段一致；`enable_chat_list_filter` 默认 false |
+| `[chat]` / `[notice]` / `[filters]` | `[chat]` 名单配置已移除；`ban_qq_bot` 迁至 `[filters]`；通知和正则过滤配置保持不变 |
 | API 前缀 `adapter.napcat.*` | 保持不变 |
 | `regex_filter_*` | 一致 |
 

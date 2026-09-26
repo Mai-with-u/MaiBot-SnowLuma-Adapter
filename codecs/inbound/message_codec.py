@@ -241,6 +241,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         group_id: str,
         *,
         platform_card_payloads: Optional[List[Dict[str, Any]]] = None,
+        resolve_reply_details: bool = True,
     ) -> Tuple[QQSegments, bool]:
         """将结构化 OneBot 消息段转换为 Host 消息段结构。
 
@@ -248,6 +249,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             message_payload: NapCat / OneBot 结构化消息段列表。
             self_id: 当前机器人账号 ID。
             group_id: 当前消息所在群号；私聊消息为空字符串。
+            resolve_reply_details: 是否查询引用目标详情；转发节点和引用预览只保留目标 ID。
 
         Returns:
             Tuple[QQSegments, bool]: 转换后的消息段列表，以及是否 @ 到当前机器人。
@@ -292,7 +294,9 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
                 continue
 
             if segment_type == "reply":
-                if reply_segment := await self._build_reply_segment(segment_data):
+                if reply_segment := await self._build_reply_segment(
+                    segment_data, resolve_details=resolve_reply_details
+                ):
                     converted_segments.append(reply_segment)
                 continue
 
@@ -404,13 +408,16 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             return ""
         return str(reply_id)
 
-    async def _build_reply_segment(self, segment_data: Mapping[str, Any]) -> Optional[QQSegment]:
+    async def _build_reply_segment(
+        self, segment_data: Mapping[str, Any], *, resolve_details: bool = True
+    ) -> Optional[QQSegment]:
         """构造回复消息段。
 
         SnowLuma / OneBot 会推送 ``id=0`` 的空引用，统一过滤。
 
         Args:
             segment_data: OneBot ``reply`` 段的 ``data`` 字典。
+            resolve_details: 是否查询引用目标的内容和发送者信息。
 
         Returns:
             Optional[QQSegment]: 转换后的回复消息段；缺少有效消息 ID 时返回 ``None``。
@@ -419,8 +426,8 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         if not target_message_id:
             return None
 
-        message_detail = await self._query_service.get_message_detail(target_message_id)
         reply_payload: Dict[str, Any] = {"target_message_id": target_message_id}
+        message_detail = await self._query_service.get_message_detail(target_message_id) if resolve_details else None
         if message_detail is not None:
             sender = message_detail.get("sender", {})
             if not isinstance(sender, Mapping):
@@ -444,7 +451,12 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             Optional[str]: 基于结构化消息段生成的预览文本；无法生成时返回 ``None``。
         """
         try:
-            reply_segments, _ = await self.convert_segments(message_detail, "")
+            message_payload = self._require_message_segments(message_detail)
+            group_id = str(message_detail.get("group_id") or "").strip()
+            # 引用目标可能再次引用自身或另一条消息；预览不继续查询目标详情。
+            reply_segments, _ = await self._convert_incoming_segments(
+                message_payload, "", group_id, resolve_reply_details=False
+            )
         except ValueError:
             return None
 
@@ -920,5 +932,8 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         if not normalized_segments:
             return []
 
-        segments, _ = await self._convert_incoming_segments(normalized_segments, self_id, "")
+        # 转发节点的引用可能不在当前账号的消息库中，只保留引用 ID。
+        segments, _ = await self._convert_incoming_segments(
+            normalized_segments, self_id, "", resolve_reply_details=False
+        )
         return segments

@@ -71,7 +71,7 @@ class QQMessageApiMixin(QQApiSupportMixin):
             Dict[str, Any]: 对端返回的原始响应字典。
         """
         return await self._require_query_service().delete_message(
-            message_id=self._normalize_positive_int(message_id, "message_id")
+            message_id=self._normalize_message_id(message_id, "message_id")
         )
 
     @API("adapter.napcat.message.send_group_ai_record", description="发送群 AI 语音", version="1", public=True)
@@ -115,7 +115,7 @@ class QQMessageApiMixin(QQApiSupportMixin):
             Dict[str, Any]: 对端返回的原始响应字典。
         """
         return await self._require_query_service().set_message_emoji_like(
-            message_id=self._normalize_positive_int(message_id, "message_id"),
+            message_id=self._normalize_message_id(message_id, "message_id"),
             emoji_id=self._normalize_positive_int(emoji_id, "emoji_id"),
             set_like=bool(set),
         )
@@ -131,7 +131,7 @@ class QQMessageApiMixin(QQApiSupportMixin):
             Optional[Dict[str, Any]]: 消息详情字典；失败时返回 ``None``。
         """
         return await self._require_query_service().get_message_detail(
-            str(self._normalize_positive_int(message_id, "message_id"))
+            str(self._normalize_message_id(message_id, "message_id"))
         )
 
     @API("adapter.napcat.message.get_forward_msg", description="获取合并转发消息", version="1", public=True)

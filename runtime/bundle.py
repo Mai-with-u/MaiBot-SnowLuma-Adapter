@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from ..codecs.inbound import QQInboundCodec
 from ..codecs.notice import QQNoticeCodec
 from ..codecs.outbound import QQOutboundCodec
-from ..filters import QQChatFilter, QQNoticeFilter, QQRegexFilter
+from ..filters import QQNoticeFilter, QQRegexFilter
 from ..heartbeat_monitor import QQHeartbeatMonitor
 from ..profile import NAPCAT_PROFILE, ClientProfile, ProfileState
 from ..runtime_state import QQRuntimeStateManager
@@ -28,7 +28,6 @@ class QQRuntimeBundle:
     action_service: QQActionService
     ban_state_store: QQBanStateStore
     ban_tracker: QQBanTracker
-    chat_filter: QQChatFilter
     heartbeat_monitor: QQHeartbeatMonitor
     inbound_codec: QQInboundCodec
     notice_codec: QQNoticeCodec

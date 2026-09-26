@@ -110,6 +110,14 @@ class QQApiSupportMixin:
         return normalized_value
 
     @staticmethod
+    def _normalize_message_id(value: object, field_name: str) -> int:
+        """将消息 ID 规范化为非零整数，保留对端使用的负数 ID。"""
+        normalized_value = QQApiSupportMixin._coerce_int(value, field_name, "非零整数")
+        if normalized_value == 0:
+            raise ValueError(f"{field_name} 必须是非零整数")
+        return normalized_value
+
+    @staticmethod
     def _normalize_non_negative_int(value: object, field_name: str) -> int:
         """将任意值规范化为非负整数。
 

@@ -24,7 +24,7 @@ from .apis import (
     QQSystemApiMixin,
 )
 from .config import QQPluginSettings
-from .constants import PRIVATE_CHAT_TOOL_BYPASS_SECONDS, SNOWLUMA_GATEWAY_NAME
+from .constants import SNOWLUMA_GATEWAY_NAME
 from .debug import AdaDebugLogger
 from .profile import (
     MSG_ACTION_STYLE_GENERIC,
@@ -88,8 +88,7 @@ class SnowLumaAdapterPlugin(
         "open_private_chat",
         description=(
             "向指定 QQ 用户发送一条私聊消息，用于主动开启私聊。"
-            "发送成功后，该用户在 15 分钟内的私聊入站消息会绕过适配器侧私聊名单过滤"
-            "（适配器侧过滤默认关闭时，还需在宿主适配器策略中放行该私聊）。"
+            "请在宿主适配器策略中放行该私聊。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -114,7 +113,7 @@ class SnowLumaAdapterPlugin(
         message: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """主动向指定用户发送私聊消息，并临时放行该私聊。"""
+        """主动向指定用户发送私聊消息。"""
         del kwargs
 
         try:
@@ -169,25 +168,21 @@ class SnowLumaAdapterPlugin(
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-        expires_at = runtime_bundle.chat_filter.grant_private_chat_bypass(normalized_user_id)
         response_data = response.get("data", {})
         message_id = str(response_data.get("message_id") or "") if isinstance(response_data, Mapping) else ""
         self.ctx.logger.info(
             f"已主动开启私聊: user_id={normalized_user_id} message_id={message_id or '<unknown>'}"
         )
-        bypass_minutes = PRIVATE_CHAT_TOOL_BYPASS_SECONDS // 60
         return {
             "success": True,
             "content": (
-                f"已向用户 {normalized_user_id} 发送私聊消息，并在 {bypass_minutes} 分钟内临时放行该私聊"
-                "（若适配器侧名单过滤已关闭，请确认宿主适配器策略允许该私聊）。"
+                f"已向用户 {normalized_user_id} 发送私聊消息。"
+                "请确认宿主适配器策略允许该私聊的入站消息。"
             ),
             "user_id": normalized_user_id,
             "stream_id": str(open_session_result.get("session_id") or open_session_result.get("stream_id") or ""),
             "session": open_session_result.get("stream") or {},
             "message_id": message_id,
-            "expires_at": expires_at,
-            "bypass_seconds": PRIVATE_CHAT_TOOL_BYPASS_SECONDS,
         }
 
     @Tool(
@@ -459,11 +454,6 @@ class SnowLumaAdapterPlugin(
         if not runtime_bundle.transport.is_available():
             self.ctx.logger.error("适配器依赖 aiohttp，但当前环境未安装该依赖")
             return
-
-        if not settings.chat.enable_chat_list_filter:
-            self.ctx.logger.info(
-                "适配器侧聊天名单过滤已关闭（默认）：群聊/私聊通行请在宿主适配器策略中配置"
-            )
 
         runtime_bundle.regex_filter.reload_patterns(settings.filters.regex_filter_patterns)
         if settings.filters.regex_filter_enabled and settings.filters.regex_filter_patterns:

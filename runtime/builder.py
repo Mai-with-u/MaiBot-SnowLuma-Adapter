@@ -8,7 +8,7 @@ from ..codecs.inbound import QQInboundCodec
 from ..codecs.notice import QQNoticeCodec
 from ..codecs.outbound import QQOutboundCodec
 from ..config import QQPluginSettings
-from ..filters import QQChatFilter, QQNoticeFilter, QQRegexFilter
+from ..filters import QQNoticeFilter, QQRegexFilter
 from ..heartbeat_monitor import QQHeartbeatMonitor
 from ..profile import ProfileState
 from ..runtime_state import QQRuntimeStateManager
@@ -62,7 +62,6 @@ class QQRuntimeBuilder:
         Returns:
             QQRuntimeBundle: 已完成依赖注入的运行时组件集合。
         """
-        chat_filter = QQChatFilter(self._logger)
         notice_filter = QQNoticeFilter(self._logger)
         regex_filter = QQRegexFilter(self._logger)
         transport = QQTransportClient(
@@ -98,7 +97,6 @@ class QQRuntimeBuilder:
             action_service=action_service,
             ban_state_store=ban_state_store,
             ban_tracker=ban_tracker,
-            chat_filter=chat_filter,
             heartbeat_monitor=heartbeat_monitor,
             inbound_codec=inbound_codec,
             notice_codec=notice_codec,
