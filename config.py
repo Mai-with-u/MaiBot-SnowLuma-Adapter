@@ -685,17 +685,29 @@ class QQPluginSettings(PluginConfigBase):
         luma_section = _as_mapping(raw_mapping.get("luma_client"))
         napcat_section = _as_mapping(raw_mapping.get("napcat_server"))
         legacy_connection_section = _as_mapping(raw_mapping.get("connection"))
-        if luma_section and not client_section:
+        if luma_section:
             legacy_sources.append(("luma_client", luma_section))
-        if napcat_section and not client_section:
+        if napcat_section:
             legacy_sources.append(("napcat_server", napcat_section))
-        if legacy_connection_section and not client_section:
+        if legacy_connection_section:
             legacy_sources.append(("connection", legacy_connection_section))
 
         if legacy_sources:
             source_name, source_section = legacy_sources[0]
             LOGGER.warning(f"SnowLuma 适配器检测到旧版 [{source_name}] 配置段，已自动迁移到 [client]")
-            client_section = dict(source_section)
+            # Runner/SDK 在校验前会用默认值补齐缺失的配置段，[client] 因此几乎总是非空，
+            # 不能再用「[client] 为空」判断是否需要迁移，否则旧配置里的 token 等字段会被
+            # 默认值覆盖后永久丢失。这里改为逐字段合并：仅当 [client] 中该字段缺失或为空
+            # 时才用旧配置的值填充，已显式设置的用户值优先。
+            known_client_keys = set(QQServerConfig.model_fields)
+            migrated_client_section = dict(client_section)
+            for legacy_key, legacy_value in source_section.items():
+                if legacy_key not in known_client_keys:
+                    continue
+                if _normalize_string(migrated_client_section.get(legacy_key)):
+                    continue
+                migrated_client_section[legacy_key] = legacy_value
+            client_section = migrated_client_section
             # 旧 SnowLuma 配置使用 server 字段；旧 NapCat 配置使用 host 字段，统一映射为 server。
             legacy_host = _normalize_string(client_section.get("host"))
             if legacy_host and not _normalize_string(client_section.get("server")):
