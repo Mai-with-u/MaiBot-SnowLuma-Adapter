@@ -58,6 +58,23 @@ class SnowLumaAdapterPlugin(
         self._runtime_bundle: Optional[QQRuntimeBundle] = None
         self._debug_logger: Optional[AdaDebugLogger] = None
 
+    def get_components(self) -> List[Dict[str, Any]]:
+        """收集组件，并为 NapCat API 注册同名 SnowLuma 别名。"""
+        components = super().get_components()
+        aliases: List[Dict[str, Any]] = []
+        for component in components:
+            if component["type"] != "API" or not component["name"].startswith("adapter.napcat."):
+                continue
+            # 保留原处理器和完整元数据，让两个前缀共享参数、返回值及能力校验。
+            aliases.append(
+                {
+                    **component,
+                    "name": "adapter.snowluma." + component["name"].removeprefix("adapter.napcat."),
+                    "metadata": dict(component["metadata"]),
+                }
+            )
+        return components + aliases
+
     async def on_load(self) -> None:
         """在插件加载时根据配置决定是否启动连接。"""
         await self._sync_private_chat_tool_component_state()

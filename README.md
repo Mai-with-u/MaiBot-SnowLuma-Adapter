@@ -13,7 +13,8 @@
     不静默猜测。
   - 显式取值：探测仍会执行，但仅做一致性校验；配置与对端不一致时打警告并按配置声明运行。
 - **运行时热切换**：在 WebUI 修改 `client_type` 或连接参数后，插件会自动断开重连并应用新画像。
-- **统一 API 命名空间**：`adapter.napcat.*` 共 171 个公开 API（含 SnowLuma 专属 QZone 组），
+- **双 API 命名空间**：171 项公开 API 同时支持 `adapter.napcat.*` 和 `adapter.snowluma.*`
+  （共 342 个公开名称，含 SnowLuma 专属 QZone 组），两种前缀共享处理器、参数及返回值。
   QZone API 在 `client_type=napcat` 下调用会得到明确的「不支持」错误。
 - **名单交给宿主**：适配器不再内置群聊/私聊黑白名单和全局用户屏蔽名单，
   请在 WebUI 聊天页的「适配器策略」（`config/adapter_policy.toml`）中配置通行规则。
@@ -39,11 +40,35 @@
 | `plugin.*` | `plugin.*`（字段一致，新增表情模式与调试开关） |
 | `[napcat_server]` 节 | `[client]` 节（`host` → `server`，其余字段一致） |
 | `[chat]` / `[notice]` / `[filters]` | `[chat]` 名单配置已移除；`ban_qq_bot` 迁至 `[filters]`；通知和正则过滤配置保持不变 |
-| API 前缀 `adapter.napcat.*` | 保持不变 |
+| API 前缀 `adapter.napcat.*` | 保持不变，也可使用等价的 `adapter.snowluma.*` |
 | `regex_filter_*` | 一致 |
 
 NapCat 用户迁移后获得的新能力：silk 语音兜底转码、表情双模式解析、
 入站媒体 base64/本地路径取数、富文本通知、Ada 调试日志（连接 SnowLuma 时另有 QZone API）。
+
+## 其他插件调用 API
+
+通过 SDK 的 `ctx.api.call` 调用，两种前缀均使用 `version="1"`：
+
+```python
+member = await self.ctx.api.call(
+    "adapter.snowluma.group.get_group_member_info",
+    version="1",
+    group_id=123456,
+    user_id=654321,
+)
+# 将上面的 adapter.snowluma. 替换为 adapter.napcat.，调用行为完全相同。
+
+data = await self.ctx.api.call(
+    "adapter.snowluma.action.call_data",
+    version="1",
+    action_name="get_group_info",
+    params={"group_id": 123456},
+)
+```
+
+`await self.ctx.api.list()` 可查看已注册的两组名称。前缀不会切换客户端类型；
+实际能力仍取决于当前连接的客户端，两个前缀下的 QZone API 均仅支持 SnowLuma。
 
 ## 能力差异参考
 

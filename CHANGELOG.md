@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2] — 2026-09-27
+
+### 细节
+
+- 插件 API：同时支持 `adapter.napcat.*` 和 `adapter.snowluma.*`。
+- 表情回应：补齐 QQ 与 Unicode 表情，修复“未知表情”显示。
+
 ## [1.0.0] — 合并版：统一 QQ 连接器
 
 以 NapCat 适配器的模块结构为基底，合并 SnowLuma 适配器的全部特性，
@@ -22,8 +29,6 @@
   保留 NapCat 的全体禁言解除与自然解除分支、禁言状态跟踪（natural lift）与心跳监测。
 
 ### 细节（修复与特性移植）
-
-- 表情回应：补齐新版 QQ 与 Unicode 表情映射，修复大哭等回应显示为“未知表情”的问题。
 
 - 移植 silk 语音转码链（pysilk 解码 24kHz PCM → ffmpeg MP3），依赖缺失时明确警告并降级。
 - 移植 QQ 表情双模式解析（description / emoji，qq_face_parse_mode 配置项）。
