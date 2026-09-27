@@ -16,8 +16,11 @@
 - **双 API 命名空间**：171 项公开 API 同时支持 `adapter.napcat.*` 和 `adapter.snowluma.*`
   （共 342 个公开名称，含 SnowLuma 专属 QZone 组），两种前缀共享处理器、参数及返回值。
   QZone API 在 `client_type=napcat` 下调用会得到明确的「不支持」错误。
-- **名单交给宿主**：适配器不再内置群聊/私聊黑白名单和全局用户屏蔽名单，
+- **会话名单交给宿主**：适配器不再内置群聊/私聊黑白名单，
   请在 WebUI 聊天页的「适配器策略」（`config/adapter_policy.toml`）中配置通行规则。
+- **用户黑名单**：在适配器「消息过滤 → 用户黑名单」中填写 QQ 号，
+  或配置 `[filters].ban_user_id = ["123456", "654321"]`，拦截这些用户在所有群聊和私聊中发送的消息。
+  默认空列表；保存配置后生效。仅过滤聊天消息，不屏蔽禁言、撤回等通知事件。
 - **SnowLuma 特性移植**：silk 语音转码（依赖 `silk-python` + ffmpeg）、QQ 表情双模式解析
   （description / emoji）、入站媒体 base64:// 与本地路径取数、Ada 原始报文调试日志、
   QZone API、富文本通知（真名解析、poke 动作文、invite/kick 区分）。
@@ -29,7 +32,7 @@
 配置自动迁移：旧 `[luma_client]` 节会被读取并迁移到 `[client]`，旧版本号会自动改写。
 建议直接使用新的 `[client]` 节名。名单过滤现在由宿主适配器策略负责：
 旧 `[chat]` 的群聊/私聊黑白名单不再生效，请在 WebUI 聊天页的「适配器策略」中迁移群号、私聊用户 ID 规则。
-`ban_user_id` 也不再生效；宿主策略按聊天目标过滤，不能用来复刻群内按发送者 ID 的屏蔽。
+旧 `[chat].ban_user_id` 不再生效；需要屏蔽发送者时，请将 QQ 号填写到新的 `[filters].ban_user_id`。
 `open_private_chat` 不再提供 15 分钟适配器侧放行，需要接收该私聊的后续消息时，
 请在宿主策略中放行。旧 `[chat].ban_qq_bot` 会自动迁移到 `[filters].ban_qq_bot`。
 

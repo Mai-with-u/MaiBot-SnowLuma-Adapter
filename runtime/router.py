@@ -116,8 +116,13 @@ class QQEventRouter:
         if not sender_user_id:
             return
 
+        # 在成员查询和消息解析前拦截，群聊、私聊共用发送者黑名单。
+        if sender_user_id in settings.filters.ban_user_id:
+            self._logger.debug(f"用户 {sender_user_id} 在黑名单中，消息已丢弃")
+            return
+
         group_id = str(payload.get("group_id") or "").strip()
-        if self_id and sender_user_id == self_id and settings.filters.ignore_self_message:
+        if self_id and sender_user_id == self_id and settings.debug.ignore_self_message:
             return
         if await runtime.official_bot_guard.should_reject(
             sender_user_id=sender_user_id,

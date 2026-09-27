@@ -119,13 +119,13 @@ class AdaDebugLogger:
     def inbound_enabled(self) -> bool:
         """返回是否启用了入站原始报文日志。"""
 
-        return bool(self._load_settings().plugin.enable_ada_debug_raw_message_log)
+        return bool(self._load_settings().debug.enable_ada_debug_raw_message_log)
 
     @property
     def outbound_enabled(self) -> bool:
         """返回是否启用了出站原始报文日志。"""
 
-        return bool(self._load_settings().plugin.enable_ada_debug_raw_outbound_message_log)
+        return bool(self._load_settings().debug.enable_ada_debug_raw_outbound_message_log)
 
     def log_raw_inbound(self, message_id: str, payload: Mapping[str, Any]) -> None:
         """记录一条入站消息的原始报文。

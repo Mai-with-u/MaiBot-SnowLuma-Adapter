@@ -2,7 +2,7 @@
 
 同一套配置同时支撑 SnowLuma 与 NapCat 两类客户端：
 [client].client_type 决定连接画像（auto 表示连接后自动判定），
-插件不再内置黑白名单过滤，入站过滤统一交给宿主 adapter_policy。
+会话黑白名单交给宿主 adapter_policy，发送者黑名单由适配器过滤。
 """
 
 from __future__ import annotations
@@ -140,42 +140,6 @@ class QQPluginOptions(PluginConfigBase):
             "order": 2,
         },
     )
-    enable_ada_debug_raw_message_log: bool = Field(
-        default=False,
-        description="调试模式：记录入站原始消息段。",
-        json_schema_extra={
-            "label": "显示原始消息段",
-            "hint": "仅排查消息段结构问题时开启；开启后会记录每条入站消息的原始 message 字段。",
-            "i18n": _schema_i18n(
-                label_en="Raw inbound debug",
-                label_ja="生メッセージデバッグ",
-                hint_en="Enable only while debugging segment structure; logs each inbound raw message field at info level.",
-                hint_ja="セグメント構造を調査するときだけ有効にしてください。入站 message フィールドを info レベルで記録します。",
-            ),
-            "order": 3,
-        },
-    )
-    enable_ada_debug_raw_outbound_message_log: bool = Field(
-        default=False,
-        description="调试模式：记录出站原始发送段。",
-        json_schema_extra={
-            "label": "显示原始发送段",
-            "hint": "仅排查发送消息段结构问题时开启；开启后会记录每条出站消息实际调用的 action 和 params。",
-            "i18n": _schema_i18n(
-                label_en="Raw outbound debug",
-                label_ja="生送信デバッグ",
-                hint_en=(
-                    "Enable only while debugging outbound segment structure; logs the action and params "
-                    "actually sent for each outbound message."
-                ),
-                hint_ja=(
-                    "送信セグメント構造を調査するときだけ有効にしてください。"
-                    "各送信メッセージで実際に渡す action と params を記録します。"
-                ),
-            ),
-            "order": 4,
-        },
-    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="当前配置结构版本。",
@@ -213,8 +177,68 @@ class QQPluginOptions(PluginConfigBase):
         return normalized_value or SUPPORTED_CONFIG_VERSION
 
 
+class QQDebugConfig(PluginConfigBase):
+    """消息调试配置，各开关默认关闭。"""
+
+    __ui_label__: ClassVar[str] = "调试"
+    __ui_order__: ClassVar[int] = 4
+
+    enable_ada_debug_raw_message_log: bool = Field(
+        default=False,
+        description="调试模式：记录入站原始消息段。",
+        json_schema_extra={
+            "label": "显示原始消息段",
+            "hint": "仅排查消息段结构问题时开启；开启后会记录每条入站消息的原始 message 字段。",
+            "i18n": _schema_i18n(
+                label_en="Raw inbound debug",
+                label_ja="生メッセージデバッグ",
+                hint_en="Enable only while debugging segment structure; logs each inbound raw message field at info level.",
+                hint_ja="セグメント構造を調査するときだけ有効にしてください。入站 message フィールドを info レベルで記録します。",
+            ),
+            "order": 0,
+        },
+    )
+    enable_ada_debug_raw_outbound_message_log: bool = Field(
+        default=False,
+        description="调试模式：记录出站原始发送段。",
+        json_schema_extra={
+            "label": "显示原始发送段",
+            "hint": "仅排查发送消息段结构问题时开启；开启后会记录每条出站消息实际调用的 action 和 params。",
+            "i18n": _schema_i18n(
+                label_en="Raw outbound debug",
+                label_ja="生送信デバッグ",
+                hint_en=(
+                    "Enable only while debugging outbound segment structure; logs the action and params "
+                    "actually sent for each outbound message."
+                ),
+                hint_ja=(
+                    "送信セグメント構造を調査するときだけ有効にしてください。"
+                    "各送信メッセージで実際に渡す action と params を記録します。"
+                ),
+            ),
+            "order": 1,
+        },
+    )
+
+    ignore_self_message: bool = Field(
+        default=False,
+        description="是否忽略机器人自身发送的消息。",
+        json_schema_extra={
+            "hint": "开启后会忽略机器人自身发送的消息。",
+            "i18n": _schema_i18n(
+                label_en="Ignore self messages",
+                label_ja="自身のメッセージを無視",
+                hint_en="When enabled, messages sent by the bot itself are ignored.",
+                hint_ja="有効にすると、Bot 自身が送信したメッセージを無視します。",
+            ),
+            "label": "忽略自身消息",
+            "order": 2,
+        },
+    )
+
+
 class QQServerConfig(PluginConfigBase):
-    """OneBot 正向 WebSocket 连接配置（SnowLuma / SnowLuma / NapCat 通用）。"""
+    """正向 WebSocket 连接配置（SnowLuma / NapCat 通用）。"""
 
     __ui_label__: ClassVar[str] = "客户端连接"
     __ui_order__: ClassVar[int] = 1
@@ -223,7 +247,7 @@ class QQServerConfig(PluginConfigBase):
         default="auto",
         description="对端客户端类型：auto 连接后自动判定，也可固定为 napcat 或 snowluma。",
         json_schema_extra={
-            "hint": "auto 模式在每次连接建立后通过 get_version_info 判定对端并应用对应能力；固定取值时会对判定结果做一致性校验。",
+            "hint": "auto模式会自动确定连接的客户端类型",
             "i18n": _schema_i18n(
                 label_en="Client type",
                 label_ja="クライアント種別",
@@ -462,19 +486,19 @@ class QQFilterConfig(PluginConfigBase):
     __ui_label__: ClassVar[str] = "消息过滤"
     __ui_order__: ClassVar[int] = 2
 
-    ignore_self_message: bool = Field(
-        default=True,
-        description="是否忽略机器人自身发送的消息。",
+    ban_user_id: List[str] = Field(
+        default_factory=list,
+        description="用户黑名单，拦截指定 QQ 用户的群聊和私聊消息。",
         json_schema_extra={
-            "hint": "建议保持开启，避免机器人处理自己刚刚发出的消息。",
+            "label": "用户黑名单",
+            "hint": "每项填写一个 QQ 号；消息在解析前丢弃，不传入麦麦。空列表表示不屏蔽。",
+            "order": 6,
             "i18n": _schema_i18n(
-                label_en="Ignore self messages",
-                label_ja="自身のメッセージを無視",
-                hint_en="Recommended on to avoid the bot processing messages it just sent.",
-                hint_ja="Bot が自分で送信した直後のメッセージを処理しないよう、有効のままにすることを推奨します。",
+                label_en="User blacklist",
+                label_ja="ユーザーブラックリスト",
+                hint_en="One QQ ID per entry. Group and private messages are dropped before parsing. Empty means no blocking.",
+                hint_ja="各項目に QQ 番号を入力します。対象ユーザーのグループ・個人メッセージを解析前に破棄します。空の場合はブロックしません。",
             ),
-            "label": "忽略自身消息",
-            "order": 0,
         },
     )
     ban_qq_bot: bool = Field(
@@ -529,6 +553,22 @@ class QQFilterConfig(PluginConfigBase):
             "order": 4,
         },
     )
+
+    @field_validator("ban_user_id", mode="before")
+    @classmethod
+    def _normalize_ban_user_id(cls, value: Any) -> List[str]:
+        """接受整数或字符串 QQ 号列表，校验后统一为字符串并去重。"""
+        if not isinstance(value, list):
+            raise ValueError("ban_user_id 必须是 QQ 号列表")
+        user_ids: List[str] = []
+        for item in value:
+            text = str(item).strip()
+            if not isinstance(item, (int, str)) or not text.isascii() or not text.isdecimal() or int(text) <= 0:
+                raise ValueError("ban_user_id 中的 QQ 号必须是正整数")
+            user_id = str(int(text))
+            if user_id not in user_ids:
+                user_ids.append(user_id)
+        return user_ids
 
     @field_validator("regex_filter_mode", mode="before")
     @classmethod
@@ -659,6 +699,7 @@ class QQPluginSettings(PluginConfigBase):
     client: QQServerConfig = Field(default_factory=QQServerConfig)
     notice: QQNoticeConfig = Field(default_factory=QQNoticeConfig)
     filters: QQFilterConfig = Field(default_factory=QQFilterConfig)
+    debug: QQDebugConfig = Field(default_factory=QQDebugConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -674,8 +715,20 @@ class QQPluginSettings(PluginConfigBase):
 
         raw_mapping = _as_mapping(raw_config)
         plugin_section = _as_mapping(raw_mapping.get("plugin"))
+        debug_section = _as_mapping(raw_mapping.get("debug"))
+        # 调试项从插件设置移到独立分类；保留旧配置的显式值，新分类的值优先。
+        for field_name in QQDebugConfig.model_fields:
+            if field_name in plugin_section:
+                legacy_value = plugin_section.pop(field_name)
+                if field_name not in debug_section:
+                    debug_section[field_name] = legacy_value
         chat_section = _as_mapping(raw_mapping.get("chat"))
         filters_section = _as_mapping(raw_mapping.get("filters"))
+        # 自身消息过滤同样归入调试分类，保留旧配置的显式选择。
+        if "ignore_self_message" in filters_section:
+            legacy_ignore_self = filters_section.pop("ignore_self_message")
+            if "ignore_self_message" not in debug_section:
+                debug_section["ignore_self_message"] = legacy_ignore_self
         notice_section = _as_mapping(raw_mapping.get("notice"))
         if "ban_qq_bot" not in filters_section and "ban_qq_bot" in chat_section:
             filters_section["ban_qq_bot"] = chat_section["ban_qq_bot"]
@@ -710,6 +763,7 @@ class QQPluginSettings(PluginConfigBase):
 
         return {
             "client": client_section,
+            "debug": debug_section,
             "filters": filters_section,
             "notice": notice_section,
             "plugin": plugin_section,
