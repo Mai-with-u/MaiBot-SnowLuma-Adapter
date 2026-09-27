@@ -23,6 +23,8 @@
 
 ### 细节（修复与特性移植）
 
+- 表情回应：补齐新版 QQ 与 Unicode 表情映射，修复大哭等回应显示为“未知表情”的问题。
+
 - 移植 silk 语音转码链（pysilk 解码 24kHz PCM → ffmpeg MP3），依赖缺失时明确警告并降级。
 - 移植 QQ 表情双模式解析（description / emoji，qq_face_parse_mode 配置项）。
 - 移植入站媒体取数链：base64:// 引用、本地路径、get_image 动作兜底。
