@@ -236,7 +236,7 @@ class QQNoticeTextRenderer:
             for like in likes:
                 if not isinstance(like, Mapping):
                     continue
-                emoji_id = str(like.get("emoji_id") or "").strip()
+                emoji_id = str(like.get("emoji_id", "")).strip()
                 count = like.get("count", 1)
                 emoji_text = QQ_FACE_DESCRIPTIONS.get(emoji_id, f"未知表情{emoji_id}") if emoji_id else "未知表情"
                 if count and count != 1:

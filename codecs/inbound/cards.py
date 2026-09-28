@@ -481,7 +481,7 @@ class QQInboundCardMixin:
             emoji_content = item.get("emoji_content", {})
             if not isinstance(emoji_content, Mapping):
                 continue
-            emoji_id = str(emoji_content.get("id") or "").strip()
+            emoji_id = str(emoji_content.get("id", "")).strip()
             if emoji_id in QQ_FACE:
                 face_text_parts.append(QQ_FACE[emoji_id])
         return "".join(face_text_parts)

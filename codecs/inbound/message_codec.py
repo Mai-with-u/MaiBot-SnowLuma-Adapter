@@ -639,7 +639,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         Returns:
             QQSegment: 转换后的文本消息段。
         """
-        face_id = str(segment_data.get("id") or "").strip()
+        face_id = str(segment_data.get("id", "")).strip()
         face_text = self._resolve_face_text(face_id)
         return self._build_text_segment(face_text)
 
