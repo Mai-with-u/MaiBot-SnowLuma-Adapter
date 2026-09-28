@@ -757,6 +757,10 @@ class QQPluginSettings(PluginConfigBase):
             for legacy_key, legacy_value in source_section.items():
                 if legacy_key not in known_client_keys:
                     continue
+                # SDK 补齐的默认端口也会被视为非空；旧端口应优先于这个默认值。
+                if legacy_key == "port" and migrated_client_section.get("port") == DEFAULT_CLIENT_PORT:
+                    migrated_client_section["port"] = legacy_value
+                    continue
                 if _normalize_string(migrated_client_section.get(legacy_key)):
                     continue
                 migrated_client_section[legacy_key] = legacy_value
