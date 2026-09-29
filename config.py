@@ -29,6 +29,8 @@ LOGGER = logging.getLogger("snowluma_adapter.config")
 CLIENT_TYPE_VALUES = Literal["auto", "napcat", "snowluma"]
 
 
+
+
 def _schema_i18n(
     *,
     label_en: str,
@@ -77,6 +79,137 @@ def _notice_field(
     )
 
 
+class QQChatAbilitiesConfig(PluginConfigBase):
+    """聊天能力（LLM 工具）开关配置。"""
+
+    __ui_label__: ClassVar[str] = "聊天能力"
+    __ui_order__: ClassVar[int] = 1
+
+    enable_private_chat_tool: bool = Field(
+        default=False,
+        description="是否启用主动开启私聊工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可向指定 QQ 用户发送首条私聊消息；请在宿主适配器策略中放行该私聊。",
+            "i18n": _schema_i18n(
+                label_en="Enable private chat tool",
+                label_ja="個人チャット開始ツールを有効化",
+                hint_en=(
+                    "When enabled, the model can send the first private message to a user; "
+                    "grant the chat in the host adapter policy."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルは指定ユーザーへ最初の個人メッセージを送信できます；"
+                    "ホスト側のアダプターポリシーでその個人チャットを許可してください。"
+                ),
+            ),
+            "label": "启用主动私聊工具",
+            "order": 0,
+        },
+    )
+    enable_poke_tool: bool = Field(
+        default=False,
+        description="是否启用戳一戳工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可向指定 QQ 用户发送戳一戳；群聊中戳当前群成员，私聊中发送好友戳一戳。",
+            "i18n": _schema_i18n(
+                label_en="Enable poke tool",
+                label_ja="poke ツールを有効化",
+                hint_en=(
+                    "When enabled, the model can poke a QQ user; in group chats the current group is used, "
+                    "in private chats a friend poke is sent."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルは指定ユーザーに poke を送信できます；"
+                    "グループチャットでは現在のグループ、個人チャットでは友達への poke を送信します。"
+                ),
+            ),
+            "label": "启用戳一戳工具",
+            "order": 1,
+        },
+    )
+    enable_recall_tool: bool = Field(
+        default=False,
+        description="是否启用消息撤回工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可撤回消息；撤回自己的消息限 2 分钟内，撤回他人消息需要机器人是群管理员。",
+            "i18n": _schema_i18n(
+                label_en="Enable recall tool",
+                label_ja="メッセージ撤回ツールを有効化",
+                hint_en=(
+                    "When enabled, the model can recall messages; own messages within 2 minutes, "
+                    "others' messages require the bot to be a group admin."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルはメッセージを撤回できます；"
+                    "自身のメッセージは 2 分以内、他人のメッセージは Bot がグループ管理者である必要があります。"
+                ),
+            ),
+            "label": "启用消息撤回工具",
+            "order": 2,
+        },
+    )
+    enable_mute_tool: bool = Field(
+        default=False,
+        description="是否启用智能禁言工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可根据消息 ID 禁言发送者；群主、管理员及保护名单中的用户不会被禁言，"
+            "可通过 [mute] 节限制生效群与时长范围。",
+            "i18n": _schema_i18n(
+                label_en="Enable mute tool",
+                label_ja="ミュートツールを有効化",
+                hint_en=(
+                    "When enabled, the model can mute the sender of a message by its ID; "
+                    "group owners, admins and protected users are never muted. "
+                    "Scope groups and duration limits in the [mute] section."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルはメッセージ ID で送信者をミュートできます；"
+                    "グループのオーナー・管理者・保護リストのユーザーはミュートされません。"
+                    "対象グループと時間の範囲は [mute] セクションで制限できます。"
+                ),
+            ),
+            "label": "启用智能禁言工具",
+            "order": 3,
+        },
+    )
+    enable_emoji_like_tool: bool = Field(
+        default=False,
+        description="是否启用表情表态工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可给消息贴表情回应（如赞、爱心）。",
+            "i18n": _schema_i18n(
+                label_en="Enable emoji reaction tool",
+                label_ja="絵文字リアクションツールを有効化",
+                hint_en="When enabled, the model can react to a message with a QQ emoji (e.g. thumbs up, heart).",
+                hint_ja="有効にすると、モデルはメッセージに QQ 絵文字（いいね・ハートなど）でリアクションできます。",
+            ),
+            "label": "启用表情表态工具",
+            "order": 4,
+        },
+    )
+    enable_forward_tool: bool = Field(
+        default=False,
+        description="是否启用消息转发工具。",
+        json_schema_extra={
+            "hint": "开启后，模型可把一批消息打包成合并转发，发送到指定群或私聊。",
+            "i18n": _schema_i18n(
+                label_en="Enable forward tool",
+                label_ja="転送ツールを有効化",
+                hint_en=(
+                    "When enabled, the model can bundle messages into a merged forward "
+                    "and send it to a specific group or private chat."
+                ),
+                hint_ja=(
+                    "有効にすると、モデルはメッセージをまとめて転送し、"
+                    "指定したグループまたは個人チャットへ送信できます。"
+                ),
+            ),
+            "label": "启用消息转发工具",
+            "order": 5,
+        },
+    )
+
+
 class QQPluginOptions(PluginConfigBase):
     """插件级配置。"""
 
@@ -98,27 +231,6 @@ class QQPluginOptions(PluginConfigBase):
             "order": 0,
         },
     )
-    enable_private_chat_tool: bool = Field(
-        default=False,
-        description="是否启用主动开启私聊工具。",
-        json_schema_extra={
-            "hint": "开启后，模型可向指定 QQ 用户发送首条私聊消息；请在宿主适配器策略中放行该私聊。",
-            "i18n": _schema_i18n(
-                label_en="Enable private chat tool",
-                label_ja="個人チャット開始ツールを有効化",
-                hint_en=(
-                    "When enabled, the model can send the first private message to a user; "
-                    "grant the chat in the host adapter policy."
-                ),
-                hint_ja=(
-                    "有効にすると、モデルは指定ユーザーへ最初の個人メッセージを送信できます；"
-                    "ホスト側のアダプターポリシーでその個人チャットを許可してください。"
-                ),
-            ),
-            "label": "启用主动私聊工具",
-            "order": 1,
-        },
-    )
     qq_face_parse_mode: Literal["description", "emoji"] = Field(
         default="description",
         description="QQ 自带表情解析模式：转为中文描述或近似 Unicode emoji。",
@@ -137,7 +249,7 @@ class QQPluginOptions(PluginConfigBase):
                     "emoji は近い Unicode 絵文字を優先します。"
                 ),
             ),
-            "order": 2,
+            "order": 1,
         },
     )
     config_version: str = Field(
@@ -181,7 +293,7 @@ class QQDebugConfig(PluginConfigBase):
     """消息调试配置，各开关默认关闭。"""
 
     __ui_label__: ClassVar[str] = "调试"
-    __ui_order__: ClassVar[int] = 4
+    __ui_order__: ClassVar[int] = 5
 
     enable_ada_debug_raw_message_log: bool = Field(
         default=False,
@@ -241,7 +353,7 @@ class QQServerConfig(PluginConfigBase):
     """正向 WebSocket 连接配置（SnowLuma / NapCat 通用）。"""
 
     __ui_label__: ClassVar[str] = "客户端连接"
-    __ui_order__: ClassVar[int] = 1
+    __ui_order__: ClassVar[int] = 2
 
     client_type: CLIENT_TYPE_VALUES = Field(
         default="auto",
@@ -484,7 +596,7 @@ class QQFilterConfig(PluginConfigBase):
     """消息过滤配置。"""
 
     __ui_label__: ClassVar[str] = "消息过滤"
-    __ui_order__: ClassVar[int] = 2
+    __ui_order__: ClassVar[int] = 3
 
     ban_user_id: List[str] = Field(
         default_factory=list,
@@ -596,7 +708,7 @@ class QQNoticeConfig(PluginConfigBase):
     """
 
     __ui_label__: ClassVar[str] = "通知事件"
-    __ui_order__: ClassVar[int] = 3
+    __ui_order__: ClassVar[int] = 4
 
     enabled: bool = Field(
         default=True,
@@ -692,14 +804,83 @@ class QQNoticeConfig(PluginConfigBase):
     )
 
 
+class QQMuteConfig(PluginConfigBase):
+    """智能禁言工具的约束配置。"""
+
+    __ui_label__: ClassVar[str] = "禁言工具"
+    __ui_order__: ClassVar[int] = 6
+
+    admin_users: List[str] = Field(
+        default_factory=list,
+        description="禁言保护名单，名单内的用户不会被禁言。",
+        json_schema_extra={
+            "hint": "每项一个 QQ 号，支持 qq:123456 或 123456 两种写法；群主和管理员始终受保护。",
+            "label": "禁言保护名单",
+            "order": 0,
+        },
+    )
+    allowed_groups: List[str] = Field(
+        default_factory=list,
+        description="允许禁言的群白名单，空列表表示不限制。",
+        json_schema_extra={
+            "hint": "每项一个群号，支持 qq:123456 或 123456 两种写法；空列表表示所有群可用。",
+            "label": "禁言群白名单",
+            "order": 1,
+        },
+    )
+    min_duration: int = Field(
+        default=60,
+        description="最短禁言时长，单位秒。",
+        json_schema_extra={
+            "hint": "模型给出的禁言时长低于该值时会被抬升到该值。",
+            "label": "最短时长（秒）",
+            "order": 2,
+        },
+    )
+    max_duration: int = Field(
+        default=2592000,
+        description="最长禁言时长，单位秒。",
+        json_schema_extra={
+            "hint": "模型给出的禁言时长超过该值时会被截断到该值，默认 30 天。",
+            "label": "最长时长（秒）",
+            "order": 3,
+        },
+    )
+
+    @field_validator("admin_users", "allowed_groups", mode="before")
+    @classmethod
+    def _normalize_scoped_id_lists(cls, value: Any) -> List[str]:
+        """规范化带平台前缀的 ID 列表，去除空白与重复项。"""
+        if not isinstance(value, list):
+            return []
+        normalized_values: List[str] = []
+        seen_values = set()
+        for item in value:
+            item_text = str(item).strip()
+            if not item_text or item_text in seen_values:
+                continue
+            seen_values.add(item_text)
+            normalized_values.append(item_text)
+        return normalized_values
+
+    @field_validator("min_duration", "max_duration", mode="before")
+    @classmethod
+    def _normalize_positive_duration_fields(cls, value: Any, info: ValidationInfo) -> int:
+        """规范化正整数时长字段。"""
+        defaults: Dict[str, int] = {"min_duration": 60, "max_duration": 2592000}
+        return _normalize_positive_int(value, defaults[str(info.field_name)])
+
+
 class QQPluginSettings(PluginConfigBase):
     """SnowLuma 适配器（统一 QQ 连接器）完整配置。"""
 
     plugin: QQPluginOptions = Field(default_factory=QQPluginOptions)
+    chat_abilities: QQChatAbilitiesConfig = Field(default_factory=QQChatAbilitiesConfig)
     client: QQServerConfig = Field(default_factory=QQServerConfig)
     notice: QQNoticeConfig = Field(default_factory=QQNoticeConfig)
     filters: QQFilterConfig = Field(default_factory=QQFilterConfig)
     debug: QQDebugConfig = Field(default_factory=QQDebugConfig)
+    mute: QQMuteConfig = Field(default_factory=QQMuteConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -716,6 +897,13 @@ class QQPluginSettings(PluginConfigBase):
         raw_mapping = _as_mapping(raw_config)
         plugin_section = _as_mapping(raw_mapping.get("plugin"))
         debug_section = _as_mapping(raw_mapping.get("debug"))
+        chat_abilities_section = _as_mapping(raw_mapping.get("chat_abilities"))
+        # 工具开关从插件设置移到独立分类 [chat_abilities]。
+        # SDK 会在校验前用默认值补齐 [chat_abilities]（全 false），因此 [plugin] 中
+        # 残留的旧字段值必须无条件搬迁，否则用户的开关状态会被默认值吞掉。
+        for field_name in QQChatAbilitiesConfig.model_fields:
+            if field_name in plugin_section:
+                chat_abilities_section[field_name] = plugin_section.pop(field_name)
         # 调试项从插件设置移到独立分类；保留旧配置的显式值，新分类的值优先。
         for field_name in QQDebugConfig.model_fields:
             if field_name in plugin_section:
@@ -732,6 +920,7 @@ class QQPluginSettings(PluginConfigBase):
         notice_section = _as_mapping(raw_mapping.get("notice"))
         if "ban_qq_bot" not in filters_section and "ban_qq_bot" in chat_section:
             filters_section["ban_qq_bot"] = chat_section["ban_qq_bot"]
+        mute_section = _as_mapping(raw_mapping.get("mute"))
 
         client_section = _as_mapping(raw_mapping.get("client"))
         legacy_sources: List[tuple[str, Mapping[str, Any]]] = []
@@ -778,9 +967,11 @@ class QQPluginSettings(PluginConfigBase):
             plugin_section["config_version"] = SUPPORTED_CONFIG_VERSION
 
         return {
+            "chat_abilities": chat_abilities_section,
             "client": client_section,
             "debug": debug_section,
             "filters": filters_section,
+            "mute": mute_section,
             "notice": notice_section,
             "plugin": plugin_section,
         }
