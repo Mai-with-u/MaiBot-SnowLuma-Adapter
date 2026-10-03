@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import re
 
 from maibot_sdk import API
 
@@ -11,6 +12,28 @@ from .support import QQApiIdInput, QQApiParamsInput, QQApiSupportMixin
 
 class QQAccountApiMixin(QQApiSupportMixin):
     """QQ 账号、好友与资料相关 API。"""
+
+    @API("adapter.avatar.get", description="获取独立用户或群头像资源", version="1", public=True)
+    async def api_get_avatar(
+        self, platform: str, target_id: str, target_type: str = "user",
+        account_id: str = "", scope: str = "",
+    ) -> Dict[str, Any]:
+        """统一头像协议：只返回资源 URL，图片由 Host 按有效期独立缓存。"""
+        if platform != "qq":
+            return {"status": "unsupported"}
+        if target_type not in {"user", "group"}:
+            raise ValueError("target_type 必须为 user 或 group")
+        # 官方机器人 OpenID 无法用于数字 QQ 号头像 URL，属于不支持的目标类型。
+        normalized_target_id = target_id.strip()
+        if re.fullmatch(r"[0-9A-Fa-f]{32}", normalized_target_id) and not normalized_target_id.isdecimal():
+            return {"status": "unsupported"}
+        normalized_id = self._normalize_positive_int(target_id, "target_id")
+        url = (
+            f"https://p.qlogo.cn/gh/{normalized_id}/{normalized_id}/640"
+            if target_type == "group"
+            else f"https://q1.qlogo.cn/g?b=qq&nk={normalized_id}&s=640"
+        )
+        return {"status": "available", "url": url, "expires_in": 86400}
 
     @API("adapter.napcat.account.set_qq_profile", description="设置 QQ 账号资料", version="1", public=True)
     async def api_set_qq_profile(

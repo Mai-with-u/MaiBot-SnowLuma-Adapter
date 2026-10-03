@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "SnowLuma 适配器/ SnowLuma Adapter",
   "description": "QQ适配器，同时支持 SnowLuma 与 NapCat 客户端",
   "author": {
