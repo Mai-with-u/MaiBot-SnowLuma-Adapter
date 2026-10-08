@@ -59,6 +59,10 @@ class QQOutboundSegmentEncoder:
                 outbound_segments.extend(built_segments)
                 continue
 
+            # 无法定位的引用只需移除，不应把控制段转换成聊天正文。
+            if item_type == "reply":
+                continue
+
             fallback_text = self._build_empty_segment_fallback(item_type)
             outbound_segments.append({"type": "text", "data": {"text": fallback_text}})
 

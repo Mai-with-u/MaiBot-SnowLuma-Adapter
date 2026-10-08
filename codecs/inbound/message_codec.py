@@ -424,7 +424,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             resolve_details: 是否查询引用目标的内容和发送者信息。
 
         Returns:
-            Optional[QQSegment]: 转换后的回复消息段；缺少有效消息 ID 时返回 ``None``。
+            Optional[QQSegment]: 转换后的回复消息段；缺少有效消息 ID 或查询不到原消息时返回 ``None``。
         """
         target_message_id = self._normalize_inbound_reply_id(segment_data.get("id"))
         if not target_message_id:
@@ -432,6 +432,8 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
 
         reply_payload: Dict[str, Any] = {"target_message_id": target_message_id}
         message_detail = await self._query_service.get_message_detail(target_message_id) if resolve_details else None
+        if resolve_details and message_detail is None:
+            return None
         if message_detail is not None:
             sender = message_detail.get("sender", {})
             if not isinstance(sender, Mapping):
