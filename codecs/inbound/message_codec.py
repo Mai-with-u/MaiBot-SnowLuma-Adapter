@@ -69,9 +69,11 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         """
         message_type = str(payload.get("message_type") or "").strip() or "private"
         group_id = str(payload.get("group_id") or "").strip()
+        # 群临时私聊也携带来源 group_id；会话类型必须以 message_type 为准。
+        is_group_chat = message_type == "group"
         # SnowLuma 的推送不带 group_name，需要查询对端补全（移植自 SnowLuma 适配器）；
         # NapCat 推送自带该字段，查询不会触发。
-        group_name = await self._resolve_group_name(payload, group_id)
+        group_name = await self._resolve_group_name(payload, group_id) if is_group_chat else ""
         user_nickname = str(sender.get("nickname") or sender.get("card") or sender_user_id).strip() or sender_user_id
         user_cardname = str(sender.get("card") or "").strip() or None
 
@@ -89,10 +91,12 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             "napcat_message_type": message_type,
             "client_type": self._profile_state.profile.client_type,
         }
-        if group_id:
+        if is_group_chat and group_id:
             additional_config["platform_io_target_group_id"] = group_id
         else:
             additional_config["platform_io_target_user_id"] = sender_user_id
+            if group_id:
+                additional_config["platform_io_temp_group_id"] = group_id
         if platform_card_payloads:
             additional_config["platform_card_payloads"] = platform_card_payloads
 
@@ -104,7 +108,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             },
             "additional_config": additional_config,
         }
-        if group_id:
+        if is_group_chat and group_id:
             message_info["group_info"] = {"group_id": group_id, "group_name": group_name}
 
         # message_id 是平台侧消息的主键，缺失时无法引用/去重/撤回；
