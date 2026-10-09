@@ -409,6 +409,27 @@ class QQServerConfig(PluginConfigBase):
             "order": 2,
         },
     )
+    enable_tls: bool = Field(
+        default=False,
+        description="是否启用 TLS 加密的 WebSocket 连接（wss）。",
+        json_schema_extra={
+            "hint": "开启后使用 wss:// 并校验服务端证书，关闭时使用 ws://；端口仍需与对端配置一致。",
+            "i18n": _schema_i18n(
+                label_en="Enable TLS",
+                label_ja="TLS を有効化",
+                hint_en=(
+                    "Use wss:// with server certificate verification when enabled, or ws:// when disabled. "
+                    "The port must still match the server configuration."
+                ),
+                hint_ja=(
+                    "有効時は wss:// を使用してサーバー証明書を検証し、無効時は ws:// を使用します。"
+                    "ポートは引き続きサーバーの設定に合わせてください。"
+                ),
+            ),
+            "label": "是否启用 TLS",
+            "order": 3,
+        },
+    )
     token: str = Field(
         default="",
         description="访问令牌，未启用鉴权时可留空。",
@@ -424,7 +445,7 @@ class QQServerConfig(PluginConfigBase):
             ),
             "input_type": "password",
             "label": "访问令牌",
-            "order": 3,
+            "order": 4,
             "placeholder": "可留空",
         },
     )
@@ -440,7 +461,7 @@ class QQServerConfig(PluginConfigBase):
                 hint_ja="WebSocket プロトコルレベルの ping 保活間隔です。0 より大きい値にしてください。",
             ),
             "label": "心跳间隔（秒）",
-            "order": 4,
+            "order": 5,
             "step": 1,
         },
     )
@@ -456,7 +477,7 @@ class QQServerConfig(PluginConfigBase):
                 hint_ja="接続が切断された後、再接続を試すまでこの時間待機します。",
             ),
             "label": "重连等待（秒）",
-            "order": 5,
+            "order": 6,
             "step": 1,
         },
     )
@@ -472,7 +493,7 @@ class QQServerConfig(PluginConfigBase):
                 hint_ja="メッセージ送信や情報取得などのアクションは、この時間を超えるとエラーになります。",
             ),
             "label": "动作超时（秒）",
-            "order": 6,
+            "order": 7,
             "step": 1,
         },
     )
@@ -490,7 +511,7 @@ class QQServerConfig(PluginConfigBase):
                 placeholder_ja="例：primary",
             ),
             "label": "连接标识",
-            "order": 7,
+            "order": 8,
             "placeholder": "例如：primary",
         },
     )
@@ -502,7 +523,8 @@ class QQServerConfig(PluginConfigBase):
             str: 供适配器作为客户端连接的 WebSocket 地址。
         """
 
-        return f"ws://{self.server}:{self.port}"
+        scheme = "wss" if self.enable_tls else "ws"
+        return f"{scheme}://{self.server}:{self.port}"
 
     @field_validator("client_type", mode="before")
     @classmethod
