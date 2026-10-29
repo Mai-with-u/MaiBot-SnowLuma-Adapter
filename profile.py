@@ -17,6 +17,10 @@ token 鉴权不区分画像：传输层同时附带 ``Authorization: Bearer`` �
 对端类型判定基于标准动作 ``get_version_info`` 返回的 ``app_name``：
 该字段由各实现自报家门（SnowLuma 返回 "SnowLuma"，对端返回 "NapCat"），
 属于确定性识别而非启发式猜测。
+
+自动判定仅服务于 ``client_type=auto``。显式配置了 ``napcat`` / ``snowluma`` 时，
+app_name 由第三方实现（如 LLOneBot）自报而不可识别并不改变协议兼容性，
+此时按配置声明继续连接，探测只作为诊断信息。
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Tuple
 import asyncio
 
 PROBE_ACTION = "get_version_info"
+CLIENT_TYPE_AUTO = "auto"
 PROBE_ATTEMPTS = 2
 PROBE_RETRY_INTERVAL_SEC = 1.0
 
@@ -130,7 +135,8 @@ def detect_client_type_from_app_name(app_name: str) -> Optional[str]:
         app_name: 对端自报的实现名称。
 
     Returns:
-        Optional[str]: 判定出的客户端类型；无法识别时返回 ``None``（由调用方显式报错）。
+        Optional[str]: 判定出的客户端类型；无法识别时返回 ``None``，由调用方决定回退策略
+        （``auto`` 报错，显式声明按配置运行）。
     """
 
     normalized_app_name = str(app_name or "").strip().lower()
@@ -143,22 +149,47 @@ def detect_client_type_from_app_name(app_name: str) -> Optional[str]:
     return None
 
 
+@dataclass(frozen=True)
+class ProbeResult:
+    """一次对端探测的结果。
+
+    Attributes:
+        client_type: 实际生效的客户端类型（显式配置优先于探测）。
+        detected_type: ``app_name`` 判定出的类型；无法识别或探测失败时为 ``None``。
+        app_name: 对端自报的实现名称，未知时为空字符串。
+        app_version: 对端自报的版本号，未知时为空字符串。
+    """
+
+    client_type: str
+    detected_type: Optional[str]
+    app_name: str
+    app_version: str
+
+
 async def probe_client_profile(
     call_action_data: Callable[[str, Optional[Dict[str, Any]]], Awaitable[Dict[str, Any]]],
     logger: Any,
-) -> Tuple[str, str, str]:
+    declared_type: str = CLIENT_TYPE_AUTO,
+) -> ProbeResult:
     """探测对端客户端类型。
+
+    ``auto`` 模式下探测是唯一的画像来源，无法判定必须报错；
+    显式声明了 ``napcat`` / ``snowluma`` 时以配置为准，探测仅作诊断，
+    即便对端是 app_name 未知的第三方实现（如 LLOneBot）也照常连接。
 
     Args:
         call_action_data: 发送 OneBot 动作并返回 ``data`` 字段的回调。
         logger: 插件日志对象。
+        declared_type: 配置声明的客户端类型，``auto`` 表示完全依赖探测。
 
     Returns:
-        Tuple[str, str, str]: ``(client_type, app_name, app_version)``。
+        ProbeResult: 生效客户端类型、探测判定结果（未识别时为 ``None``）与对端版本信息。
 
     Raises:
-        RuntimeError: 探测动作失败或对端类型无法识别时抛出（不静默猜测）。
+        RuntimeError: ``auto`` 模式下探测动作失败或 app_name 无法识别时抛出。
     """
+
+    is_declared = declared_type != CLIENT_TYPE_AUTO
 
     last_error: Optional[Exception] = None
     version_info: Any = None
@@ -175,17 +206,37 @@ async def probe_client_profile(
                 await asyncio.sleep(PROBE_RETRY_INTERVAL_SEC)
 
     if last_error is not None:
+        if is_declared:
+            logger.warning(
+                f"无法通过对端 {PROBE_ACTION} 探测客户端类型: {last_error}；"
+                f"按配置声明的 client_type={declared_type} 继续连接"
+            )
+            return ProbeResult(declared_type, None, "", "")
         raise RuntimeError(f"无法通过对端 {PROBE_ACTION} 探测客户端类型: {last_error}") from last_error
 
     if not isinstance(version_info, Mapping):
+        if is_declared:
+            logger.warning(
+                f"对端 {PROBE_ACTION} 响应缺少 data 字段；"
+                f"按配置声明的 client_type={declared_type} 继续连接"
+            )
+            return ProbeResult(declared_type, None, "", "")
         raise RuntimeError(f"对端 {PROBE_ACTION} 响应缺少 data 字段，无法判定客户端类型")
 
     app_name = str(version_info.get("app_name") or version_info.get("app") or "").strip()
     app_version = str(version_info.get("app_version") or version_info.get("version") or "").strip()
-    client_type = detect_client_type_from_app_name(app_name)
-    if client_type is None:
-        raise RuntimeError(
-            f"对端 app_name='{app_name or '<空>'}' 无法识别为 napcat 或 snowluma，"
-            "请在 client.client_type 中显式指定，或确认对端为受支持的实现"
-        )
-    return client_type, app_name, app_version
+    detected_type = detect_client_type_from_app_name(app_name)
+    if is_declared:
+        if detected_type is None:
+            logger.warning(
+                f"对端 app_name='{app_name or '<空>'}' 无法识别为 napcat 或 snowluma；"
+                f"按配置声明的 client_type={declared_type} 继续连接"
+            )
+        return ProbeResult(declared_type, detected_type, app_name, app_version)
+    if detected_type is not None:
+        return ProbeResult(detected_type, detected_type, app_name, app_version)
+
+    raise RuntimeError(
+        f"对端 app_name='{app_name or '<空>'}' 无法识别为 napcat 或 snowluma，"
+        "请在 client.client_type 中显式指定，或确认对端为受支持的实现"
+    )

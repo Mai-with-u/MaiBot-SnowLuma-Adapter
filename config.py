@@ -391,17 +391,17 @@ class QQServerConfig(PluginConfigBase):
         default="auto",
         description="对端客户端类型：auto 连接后自动判定，也可固定为 napcat 或 snowluma。",
         json_schema_extra={
-            "hint": "auto模式会自动确定连接的客户端类型",
+            "hint": "auto模式会自动确定连接的客户端类型；固定值时直接按该画像运行，第三方实现自报的名称不影响连接",
             "i18n": _schema_i18n(
                 label_en="Client type",
                 label_ja="クライアント種別",
                 hint_en=(
                     "auto detects the peer via get_version_info after each connect; "
-                    "a fixed value is cross-checked against the detected implementation."
+                    "a fixed value is used as-is and does not require a recognizable app_name."
                 ),
                 hint_ja=(
                     "auto は接続後に get_version_info で対向を判定します；"
-                    "固定値の場合は判定結果と一致するか検証します。"
+                    "固定値はそのまま使用され、認識可能な app_name を要求しません。"
                 ),
             ),
             "label": "客户端类型",

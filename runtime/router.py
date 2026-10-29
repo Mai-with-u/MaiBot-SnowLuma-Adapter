@@ -258,31 +258,31 @@ class QQEventRouter:
         runtime = self._require_runtime()
         settings = self._load_settings()
 
-        # 连接建立后先探测对端客户端类型：auto 模式判定画像，显式声明做一致性校验。
+        # 连接建立后先探测对端客户端类型：auto 模式判定画像，显式声明时探测仅作诊断。
         runtime.runtime_state.detected_protocol = None
+        declared_type = settings.client.client_type
         try:
-            detected_type, app_name, app_version = await probe_client_profile(
+            probe = await probe_client_profile(
                 runtime.action_service.call_action_data,
                 self._logger,
+                declared_type,
             )
         except Exception as exc:
             self._logger.error(f"客户端类型探测失败，消息网关保持未就绪: {exc}")
             return
 
-        runtime.runtime_state.detected_protocol = detected_type
-        declared_type = settings.client.client_type
-        if declared_type != "auto" and declared_type != detected_type:
-            # 按配置声明继续运行，不静默改判；提醒用户配置与对端不一致。
+        # 显式配置时以配置为准：第三方实现的 app_name 未知不影响协议兼容性。
+        runtime.runtime_state.detected_protocol = probe.client_type
+        runtime.profile_state.update(PROFILE_BY_TYPE[probe.client_type])
+        if probe.detected_type is not None and probe.detected_type != probe.client_type:
             self._logger.warning(
-                f"配置声明 client_type={declared_type}，但对端 app_name='{app_name}' 判定为 {detected_type}；"
+                f"配置声明 client_type={declared_type}，但对端 app_name='{probe.app_name}' 判定为 {probe.detected_type}；"
                 "将按配置声明的画像运行，如需跟随对端请改为 auto"
             )
-        else:
-            runtime.profile_state.update(PROFILE_BY_TYPE[detected_type])
         effective_profile = runtime.profile
         self._logger.info(
             f"客户端画像已生效: client_type={effective_profile.client_type} "
-            f"app_name={app_name or '<空>'} app_version={app_version or '<空>'}"
+            f"app_name={probe.app_name or '<空>'} app_version={probe.app_version or '<空>'}"
         )
 
         max_attempts = 3
