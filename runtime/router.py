@@ -184,6 +184,13 @@ class QQEventRouter:
         runtime = self._require_runtime()
         settings = self._load_settings()
 
+        # 通知可能同时涉及发起者、操作者和目标，均须遵守用户黑名单。
+        for field in ("user_id", "operator_id", "target_id"):
+            user_id = str(payload.get(field) or "").strip()
+            if user_id and user_id in settings.filters.ban_user_id:
+                self._logger.debug(f"通知事件涉及黑名单用户 {user_id}，已丢弃")
+                return
+
         notice_type = str(payload.get("notice_type") or "").strip()
         sub_type = str(payload.get("sub_type") or "").strip()
         if not runtime.notice_filter.is_notice_event_allowed(notice_type, sub_type, settings.notice):
@@ -269,16 +276,23 @@ class QQEventRouter:
             self._logger.error(f"客户端类型探测失败，消息网关保持未就绪: {exc}")
             return
 
-        runtime.runtime_state.detected_protocol = detected_type
         declared_type = settings.client.client_type
-        if declared_type != "auto" and declared_type != detected_type:
+        if detected_type is None:
+            if declared_type == "auto":
+                self._logger.error(
+                    f"对端 app_name='{app_name or '<空>'}' 无法识别，请在 client.client_type 中显式指定类型"
+                )
+                return
+            self._logger.warning(f"无法识别对端 app_name='{app_name or '<空>'}'，将按配置的 {declared_type} 画像运行")
+        elif declared_type != "auto" and declared_type != detected_type:
             # 按配置声明继续运行，不静默改判；提醒用户配置与对端不一致。
             self._logger.warning(
                 f"配置声明 client_type={declared_type}，但对端 app_name='{app_name}' 判定为 {detected_type}；"
                 "将按配置声明的画像运行，如需跟随对端请改为 auto"
             )
-        else:
+        elif declared_type == "auto":
             runtime.profile_state.update(PROFILE_BY_TYPE[detected_type])
+        runtime.runtime_state.detected_protocol = detected_type or app_name or declared_type
         effective_profile = runtime.profile
         self._logger.info(
             f"客户端画像已生效: client_type={effective_profile.client_type} "

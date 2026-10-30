@@ -146,7 +146,7 @@ def detect_client_type_from_app_name(app_name: str) -> Optional[str]:
 async def probe_client_profile(
     call_action_data: Callable[[str, Optional[Dict[str, Any]]], Awaitable[Dict[str, Any]]],
     logger: Any,
-) -> Tuple[str, str, str]:
+) -> Tuple[Optional[str], str, str]:
     """探测对端客户端类型。
 
     Args:
@@ -154,10 +154,10 @@ async def probe_client_profile(
         logger: 插件日志对象。
 
     Returns:
-        Tuple[str, str, str]: ``(client_type, app_name, app_version)``。
+        Tuple[Optional[str], str, str]: ``(client_type, app_name, app_version)``，未知类型为 None。
 
     Raises:
-        RuntimeError: 探测动作失败或对端类型无法识别时抛出（不静默猜测）。
+        RuntimeError: 探测动作失败或响应格式错误时抛出。
     """
 
     last_error: Optional[Exception] = None
@@ -183,9 +183,4 @@ async def probe_client_profile(
     app_name = str(version_info.get("app_name") or version_info.get("app") or "").strip()
     app_version = str(version_info.get("app_version") or version_info.get("version") or "").strip()
     client_type = detect_client_type_from_app_name(app_name)
-    if client_type is None:
-        raise RuntimeError(
-            f"对端 app_name='{app_name or '<空>'}' 无法识别为 napcat 或 snowluma，"
-            "请在 client.client_type 中显式指定，或确认对端为受支持的实现"
-        )
     return client_type, app_name, app_version
