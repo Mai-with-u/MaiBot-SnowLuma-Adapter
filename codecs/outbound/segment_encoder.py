@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
+import json
 import re
 
 from ...qq_face_map import QQ_FACE_DESCRIPTIONS
@@ -36,6 +37,7 @@ class QQOutboundSegmentEncoder:
             "forward": self._build_forward_segments,
             "image": self._build_image_segments,
             "imageurl": self._build_imageurl_segments,
+            "json": self._build_json_segments,
             "music": self._build_music_segments,
             "reply": self._build_reply_segments,
             "text": self._build_text_segments,
@@ -319,6 +321,31 @@ class QQOutboundSegmentEncoder:
         file_segment = self._build_file_segment(item.get("data"))
         return [file_segment] if file_segment else []
 
+    def _build_json_segments(self, item: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        """构造 JSON 卡片消息段；无效内容直接报错，避免发送占位文本。"""
+        return [self._build_json_segment(item.get("data"))]
+
+    @staticmethod
+    def _build_json_segment(item_data: Any) -> Dict[str, Any]:
+        """校验非空 JSON 对象，保留字符串原文及签名等全部卡片字段。"""
+        if isinstance(item_data, str):
+            try:
+                card = json.loads(item_data)
+            except ValueError as exc:
+                raise ValueError("JSON 卡片内容不是有效的 JSON") from exc
+        else:
+            card = item_data
+
+        if not isinstance(card, dict) or not card:
+            raise ValueError("JSON 卡片内容必须是非空对象")
+
+        try:
+            # 同时校验对象可序列化及数字合法性，拒绝 NaN / Infinity 等非标准 JSON 值。
+            card_json = json.dumps(card, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("JSON 卡片内容无法序列化为有效的 JSON") from exc
+        return {"type": "json", "data": {"data": item_data if isinstance(item_data, str) else card_json}}
+
     def _build_music_segments(self, item: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """构造音乐卡片消息段。
 
@@ -538,6 +565,8 @@ class QQOutboundSegmentEncoder:
         """
         raw_type = str(item_data.get("type") or "").strip()
         raw_payload = item_data.get("data", item_data)
+        if raw_type == "json":
+            return self._build_json_segment(item_data.get("data"))
         if raw_type == "file":
             return self._build_file_segment(raw_payload)
         if raw_type == "music":
