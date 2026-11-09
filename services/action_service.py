@@ -15,6 +15,8 @@ except ImportError:
     ClientTimeout = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
 
+from ..capabilities import require_standard_action
+
 if TYPE_CHECKING:
     from ..profile import ProfileState
     from ..transport import QQTransportClient
@@ -49,6 +51,16 @@ class QQActionService:
             RuntimeError: 当动作执行失败或平台返回非成功状态时抛出。
         """
         normalized_params = {str(key): value for key, value in params.items()}
+        if self._profile_state.profile.client_type == "onebot_v11":
+            require_standard_action(action_name, normalized_params)
+            # Host 使用字符串 ID，OneBot v11 标准动作要求数值 ID。
+            for key in ("user_id", "group_id", "message_id"):
+                if key not in normalized_params:
+                    continue
+                value = normalized_params[key]
+                if isinstance(value, bool) or not isinstance(value, (str, int)):
+                    raise ValueError(f"{action_name}.{key} 必须是整数 ID")
+                normalized_params[key] = int(value)
         try:
             response = await self._transport.call_action(action_name, normalized_params)
         except asyncio.CancelledError:
@@ -136,6 +148,8 @@ class QQActionService:
         """
         try:
             return await self.call_action_data(action_name, params)
+        except NotImplementedError:
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:

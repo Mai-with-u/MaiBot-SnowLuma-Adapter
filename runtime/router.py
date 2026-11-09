@@ -273,7 +273,11 @@ class QQEventRouter:
             status = payload.get("status", {})
             if not isinstance(status, Mapping):
                 status = {}
-            should_report_connected = bool(status.get("online", False)) and bool(status.get("good", False))
+            # SnowLuma 的 good 也反映近期 QQ 数据包活跃度，不能用它判定账号离线。
+            # online=False、WebSocket 断开和心跳超时仍由各自路径撤销路由。
+            should_report_connected = bool(status.get("online", False)) and (
+                runtime.profile.client_type == "snowluma" or bool(status.get("good", False))
+            )
 
         if self_id and should_report_connected:
             await runtime.runtime_state.report_connected(self_id, settings.client)
@@ -300,21 +304,26 @@ class QQEventRouter:
             return
 
         declared_type = settings.client.client_type
-        if detected_type is None:
+        if declared_type == "onebot_v11":
+            runtime.profile_state.update(PROFILE_BY_TYPE["onebot_v11"])
+        elif detected_type is None:
             if declared_type == "auto":
-                self._logger.error(
-                    f"对端 app_name='{app_name or '<空>'}' 无法识别，请在 client.client_type 中显式指定类型"
-                )
-                return
-            self._logger.warning(f"无法识别对端 app_name='{app_name or '<空>'}'，将按配置的 {declared_type} 画像运行")
+                runtime.profile_state.update(PROFILE_BY_TYPE["onebot_v11"])
+                self._logger.info(f"对端 app_name='{app_name}' 使用 OneBot v11 标准模式")
+            else:
+                runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
+                self._logger.warning(f"无法识别对端 app_name='{app_name or '<空>'}'，将按配置的 {declared_type} 画像运行")
         elif declared_type != "auto" and declared_type != detected_type:
             # 按配置声明继续运行，不静默改判；提醒用户配置与对端不一致。
+            runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
             self._logger.warning(
                 f"配置声明 client_type={declared_type}，但对端 app_name='{app_name}' 判定为 {detected_type}；"
                 "将按配置声明的画像运行，如需跟随对端请改为 auto"
             )
         elif declared_type == "auto":
             runtime.profile_state.update(PROFILE_BY_TYPE[detected_type])
+        else:
+            runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
         runtime.runtime_state.detected_protocol = detected_type or app_name or declared_type
         effective_profile = runtime.profile
         self._logger.info(

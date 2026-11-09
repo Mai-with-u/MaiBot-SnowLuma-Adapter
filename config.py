@@ -26,7 +26,7 @@ from .constants import (
 
 LOGGER = logging.getLogger("snowluma_adapter.config")
 
-CLIENT_TYPE_VALUES = Literal["auto", "napcat", "snowluma"]
+CLIENT_TYPE_VALUES = Literal["auto", "onebot_v11", "napcat", "snowluma"]
 
 
 
@@ -389,18 +389,18 @@ class QQServerConfig(PluginConfigBase):
 
     client_type: CLIENT_TYPE_VALUES = Field(
         default="auto",
-        description="对端客户端类型：auto 连接后自动判定，也可固定为 napcat 或 snowluma。",
+        description="对端客户端类型：auto 自动识别 SnowLuma / NapCat，其他实现使用 OneBot v11 标准模式；也可固定为 onebot_v11、napcat 或 snowluma。",
         json_schema_extra={
-            "hint": "auto模式会自动确定连接的客户端类型",
+            "hint": "auto 自动识别厂商扩展；onebot_v11 仅使用标准能力",
             "i18n": _schema_i18n(
                 label_en="Client type",
                 label_ja="クライアント種別",
                 hint_en=(
-                    "auto detects the peer via get_version_info after each connect; "
+                    "auto detects SnowLuma / NapCat extensions; other peers use OneBot v11 standard mode; "
                     "a fixed value is cross-checked against the detected implementation."
                 ),
                 hint_ja=(
-                    "auto は接続後に get_version_info で対向を判定します；"
+                    "auto は SnowLuma / NapCat の拡張を識別し、それ以外は OneBot v11 標準モードを使用します；"
                     "固定値の場合は判定結果と一致するか検証します。"
                 ),
             ),
@@ -549,7 +549,7 @@ class QQServerConfig(PluginConfigBase):
         """
 
         normalized_value = _normalize_string(value).lower()
-        if normalized_value in {"auto", "napcat", "snowluma"}:
+        if normalized_value in {"auto", "onebot_v11", "napcat", "snowluma"}:
             return normalized_value  # type: ignore[return-value]
         if normalized_value:
             LOGGER.warning(f"无效的 client_type 值 '{value}'，已回退到 'auto'")

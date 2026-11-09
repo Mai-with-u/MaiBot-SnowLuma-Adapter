@@ -106,7 +106,7 @@ class SnowLumaAdapterPlugin(
         self._identity_mode_watch: Optional[asyncio.Task[None]] = None
 
     def get_components(self) -> List[Dict[str, Any]]:
-        """收集组件，并为 NapCat API 注册同名 SnowLuma 别名。"""
+        """收集组件，为 NapCat API 保留 SnowLuma 别名并添加 OneBot 别名。"""
         components = super().get_components()
         aliases: List[Dict[str, Any]] = []
         for component in components:
@@ -120,7 +120,14 @@ class SnowLumaAdapterPlugin(
                     "metadata": dict(component["metadata"]),
                 }
             )
-        return components + aliases
+        onebot_aliases = [
+            {**component,
+             "name": "adapter.onebot." + component["name"].removeprefix("adapter.napcat."),
+             "metadata": dict(component["metadata"])}
+            for component in components
+            if component["type"] == "API" and component["name"].startswith("adapter.napcat.")
+        ]
+        return components + aliases + onebot_aliases
 
     @API("identity_observations", description="查询指定账号和群的短期消息指纹及用户名称", version="1", public=True)
     async def identity_observations(self, account_id: str, group_ids: List[str]) -> Dict[str, Any]:
@@ -204,6 +211,13 @@ class SnowLumaAdapterPlugin(
         else:
             self._status_badge_error = False
             self._status_badges_reported = bool(badges)
+
+    async def _handle_transport_connected(self) -> None:
+        """完成客户端画像探测后同步工具能力。"""
+        if self._event_router is None:
+            raise RuntimeError("事件路由器尚未初始化")
+        await self._event_router.bootstrap_adapter_runtime_state()
+        await self._sync_tool_components_state()
 
     async def _handle_transport_disconnected(self) -> None:
         await self._stop_identity_mode_watch()
@@ -1095,7 +1109,7 @@ class SnowLumaAdapterPlugin(
                 gateway_name=SNOWLUMA_GATEWAY_NAME,
             )
             self._runtime_bundle = runtime_builder.build(
-                on_connection_opened=self._event_router.bootstrap_adapter_runtime_state,
+                on_connection_opened=self._handle_transport_connected,
                 on_connection_closed=self._handle_transport_disconnected,
                 on_payload=self._event_router.handle_transport_payload,
                 on_natural_lift=self._event_router.emit_natural_lift_notice,
@@ -1127,15 +1141,17 @@ class SnowLumaAdapterPlugin(
 
         settings = self._load_settings()
         abilities = settings.chat_abilities
+        profile = self._runtime_bundle.profile if self._runtime_bundle else self._resolve_initial_profile(settings)
+        extensions_enabled = profile.client_type != "onebot_v11"
         tool_states = (
             ("open_private_chat", abilities.enable_private_chat_tool),
             ("get_qq_by_msg_id", abilities.enable_private_chat_tool),
-            ("send_poke", abilities.enable_poke_tool),
+            ("send_poke", abilities.enable_poke_tool and extensions_enabled),
             ("recall_message", abilities.enable_recall_tool),
             ("mute", abilities.enable_mute_tool),
-            ("react_emoji", abilities.enable_emoji_like_tool),
-            ("list_chat_streams", abilities.enable_forward_tool),
-            ("forward_messages", abilities.enable_forward_tool),
+            ("react_emoji", abilities.enable_emoji_like_tool and extensions_enabled),
+            ("list_chat_streams", abilities.enable_forward_tool and extensions_enabled),
+            ("forward_messages", abilities.enable_forward_tool and extensions_enabled),
         )
         try:
             for tool_name, enabled in tool_states:
@@ -1194,6 +1210,8 @@ class SnowLumaAdapterPlugin(
             if not settings.notice.enabled:
                 self.ctx.logger.info("通知事件转发已整体关闭：所有通知都不会传入 Host")
 
+            runtime_bundle.profile_state.update(self._resolve_initial_profile(settings))
+            await self._sync_tool_components_state()
             runtime_bundle.transport.configure(settings.client, runtime_bundle.profile_state)
             await runtime_bundle.transport.start()
 
