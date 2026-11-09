@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.1.13",
-  "name": "SnowLuma 适配器/ SnowLuma Adapter",
-  "description": "QQ适配器，同时支持 SnowLuma 与 NapCat 客户端",
+  "version": "1.3.0",
+  "name": "OneBot 适配器",
+  "description": "QQ OneBot v11 适配器，支持通用标准模式和特殊适配",
   "author": {
     "name": "MaiBot Team",
     "url": "https://github.com/Mai-with-u/MaiBot-SnowLuma-Adapter"
@@ -18,12 +18,12 @@
   "display": {
     "icon": {
       "type": "local",
-      "value": "assets/icon.jpg"
+      "value": "assets/icon-v2.png"
     }
   },
   "host_application": {
     "min_version": "1.3.18",
-    "max_version": "1.3.99"
+    "max_version": "1.4.99"
   },
   "sdk": {
     "min_version": "2.19.0",
