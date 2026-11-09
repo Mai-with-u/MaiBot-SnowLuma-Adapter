@@ -8,6 +8,8 @@ import asyncio
 
 from ..config import QQPluginSettings
 from ..profile import PROFILE_BY_TYPE, probe_client_profile
+from ..services.identity_observations import IdentityObservations
+from ..services.identity_only_lease import IdentityOnlyLease
 from ..types import QQPayloadDict
 from .bundle import QQRuntimeBundle
 
@@ -51,6 +53,8 @@ class QQEventRouter:
         self._gateway_name = gateway_name
         self._load_settings = load_settings
         self._runtime: Optional[QQRuntimeBundle] = None
+        self.identity_observations = IdentityObservations()
+        self.identity_only_lease = IdentityOnlyLease()
 
     def bind_runtime(self, runtime: QQRuntimeBundle) -> None:
         """绑定当前路由器使用的运行时依赖。
@@ -62,6 +66,8 @@ class QQEventRouter:
 
     def reset_caches(self) -> None:
         """重置与路由相关的短期缓存。"""
+        self.identity_observations.clear()
+        self.identity_only_lease.clear()
         runtime = self._runtime
         if runtime is None:
             return
@@ -115,22 +121,24 @@ class QQEventRouter:
         if not sender_user_id:
             return
 
-        # 在成员查询和消息解析前拦截，群聊、私聊共用发送者黑名单。
-        if sender_user_id in settings.filters.ban_user_id:
-            self._logger.debug(f"用户 {sender_user_id} 在黑名单中，消息已丢弃")
-            return
-
+        identity_only = self.identity_only_lease.active(self_id)
         group_id = str(payload.get("group_id") or "").strip()
-        if self_id and sender_user_id == self_id and settings.debug.ignore_self_message:
-            return
-        if await runtime.official_bot_guard.should_reject(
-            sender_user_id=sender_user_id,
-            group_id=group_id,
-            ban_qq_bot=settings.filters.ban_qq_bot,
-            payload=payload,
-            sender=sender,
-        ):
-            return
+        if not identity_only:
+            # 普通模式在成员查询和消息解析前拦截，群聊、私聊共用发送者黑名单。
+            # 身份查询模式只采集指纹，不向 Host 投递，不能受 SL 的聊天名单限制。
+            if sender_user_id in settings.filters.ban_user_id:
+                self._logger.debug(f"用户 {sender_user_id} 在黑名单中，消息已丢弃")
+                return
+            if self_id and sender_user_id == self_id and settings.debug.ignore_self_message:
+                return
+            if await runtime.official_bot_guard.should_reject(
+                sender_user_id=sender_user_id,
+                group_id=group_id,
+                ban_qq_bot=settings.filters.ban_qq_bot,
+                payload=payload,
+                sender=sender,
+            ):
+                return
 
         try:
             message_dict = await runtime.inbound_codec.build_message_dict(payload, self_id, sender_user_id, sender)
@@ -139,11 +147,19 @@ class QQEventRouter:
             return
 
         plain_text = str(message_dict.get("processed_plain_text") or "").strip()
-        if not runtime.regex_filter.is_message_allowed(plain_text, settings.filters):
+        # 解析可能等待查询。期间进入身份模式则跳过聊天过滤；期间租约到期也不能把
+        # 已绕过名单的消息投递给 Host，只允许后续新消息恢复普通过滤和投递。
+        identity_only = identity_only or self.identity_only_lease.active(self_id)
+        if not identity_only and not runtime.regex_filter.is_message_allowed(plain_text, settings.filters):
             return
 
         message_dict["account_id"] = self_id
         message_dict["scope"] = settings.client.connection_id or None
+        if isinstance(payload.get("time"), (int, float)):
+            self.identity_observations.observe(message_dict)
+        # 先采集身份再检查短租约；消息不排队、不补投，停止续期后新消息自动恢复正常。
+        if identity_only:
+            return
         external_message_id = str(payload.get("message_id") or "").strip()
         accepted = await self._gateway_capability.route_message(
             gateway_name=self._gateway_name,
@@ -184,6 +200,10 @@ class QQEventRouter:
         runtime = self._require_runtime()
         settings = self._load_settings()
 
+        # 包括普通通知与定时器合成通知，避免绕过消息入口独立触发 Host。
+        if self.identity_only_lease.active(self_id):
+            return
+
         # 通知可能同时涉及发起者、操作者和目标，均须遵守用户黑名单。
         for field in ("user_id", "operator_id", "target_id"):
             user_id = str(payload.get(field) or "").strip()
@@ -201,6 +221,9 @@ class QQEventRouter:
 
         message_dict = await runtime.notice_codec.build_notice_message_dict(payload)
         if message_dict is None:
+            return
+        # 通知解析可能等待查询；等待期间刚激活租约，也不能继续投递这条通知。
+        if self.identity_only_lease.active(self_id):
             return
 
         message_dict["account_id"] = self_id

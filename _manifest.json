@@ -37,6 +37,7 @@
     }
   ],
   "capabilities": [
+    "runtime.set_status_badges",
     "chat.get_all_streams",
     "chat.open_session",
     "component.disable",

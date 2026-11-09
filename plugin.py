@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, cast
 
 import asyncio
 
-from maibot_sdk import ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .apis import (
@@ -100,6 +100,10 @@ class SnowLumaAdapterPlugin(
         self._runtime_bundle: Optional[QQRuntimeBundle] = None
         self._debug_logger: Optional[AdaDebugLogger] = None
         self._connection_lock = asyncio.Lock()
+        self._status_badges_reported = False
+        self._status_badge_error = False
+        self._identity_mode_lock = asyncio.Lock()
+        self._identity_mode_watch: Optional[asyncio.Task[None]] = None
 
     def get_components(self) -> List[Dict[str, Any]]:
         """收集组件，并为 NapCat API 注册同名 SnowLuma 别名。"""
@@ -117,6 +121,97 @@ class SnowLumaAdapterPlugin(
                 }
             )
         return components + aliases
+
+    @API("identity_observations", description="查询指定账号和群的短期消息指纹及用户名称", version="1", public=True)
+    async def identity_observations(self, account_id: str, group_ids: List[str]) -> Dict[str, Any]:
+        """仅向协作插件提供指纹，不提供消息正文；无连接时返回空快照。"""
+        if (self._event_router is None or self._runtime_bundle is None
+                or self._runtime_bundle.runtime_state.account_id != account_id):
+            return {"protocol": 1, "observations": []}
+        return self._event_router.identity_observations.snapshot(account_id, group_ids)
+
+    @API("identity_only_lease", description="续期或释放短时身份查询模式，超时恢复普通收发路由", version="1", public=True)
+    async def identity_only_lease(self, account_id: str, owner: str, enabled: bool = True) -> Dict[str, Any]:
+        """仅操作当前已就绪账号；独立于查询接口，空闲无消息时也必须持续续期。"""
+        if (self._event_router is None or self._runtime_bundle is None
+                or self._runtime_bundle.runtime_state.account_id != account_id):
+            return {"active": False, "ttl": 0}
+        result = self._event_router.identity_only_lease.update(account_id, owner, enabled)
+        # 先建立独立到期任务，调用方超时/取消也不能让已撤销的路由永久残留。
+        if self._identity_mode_watch is None or self._identity_mode_watch.done():
+            self._identity_mode_watch = asyncio.create_task(self._watch_identity_mode(), name="qq-identity-mode-expiry")
+        await self._sync_identity_mode()
+        result["active"] = self._event_router.identity_only_lease.active(account_id)
+        return result
+
+    async def _sync_identity_mode(self) -> None:
+        async with self._identity_mode_lock:
+            if self._runtime_bundle is None or self._event_router is None:
+                return
+            state = self._runtime_bundle.runtime_state
+            account_id = state.account_id
+            if account_id is None:
+                return
+            active = self._event_router.identity_only_lease.active(account_id)
+            # 使用标准网关 ready 状态撤销/恢复路由，主程序不需要识别 SL 或身份查询模式。
+            await state.set_routing_enabled(not active, self._load_settings().client)
+            await self._publish_identity_only_status(account_id)
+
+    async def _watch_identity_mode(self) -> None:
+        failed = False
+        while True:
+            try:
+                await self._sync_identity_mode()
+                failed = False
+            except Exception as exc:
+                if not failed:
+                    self.ctx.logger.warning("SL 身份查询模式路由切换失败，将重试: %s", exc, exc_info=True)
+                failed = True
+                await asyncio.sleep(1)
+                continue
+            if self._runtime_bundle is None or self._event_router is None:
+                return
+            account_id = self._runtime_bundle.runtime_state.account_id
+            remaining = self._event_router.identity_only_lease.remaining(account_id or "")
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
+
+    async def _stop_identity_mode_watch(self) -> None:
+        task = self._identity_mode_watch
+        self._identity_mode_watch = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _publish_identity_only_status(self, account_id: str = "") -> None:
+        badges = self._event_router.identity_only_lease.status_badges(account_id) if self._event_router is not None else []
+        if not badges and not self._status_badges_reported:
+            return
+        # 请求失败或响应丢失时仍记住已尝试上报，以便断连时清除可能已生效的标记。
+        self._status_badges_reported = True
+        try:
+            result = await self.ctx.call_capability("runtime.set_status_badges", timeout_ms=2000, badges=badges)
+            if not isinstance(result, dict) or not result.get("success"):
+                raise RuntimeError(f"Host 未接受运行标记: {result}")
+        except Exception as exc:
+            if not self._status_badge_error:
+                self.ctx.logger.warning("SL 运行标记上报失败: %s", exc)
+            self._status_badge_error = True
+        else:
+            self._status_badge_error = False
+            self._status_badges_reported = bool(badges)
+
+    async def _handle_transport_disconnected(self) -> None:
+        await self._stop_identity_mode_watch()
+        try:
+            if self._event_router is not None:
+                await self._event_router.handle_transport_disconnected()
+        finally:
+            await self._publish_identity_only_status()
 
     async def on_load(self) -> None:
         """在插件加载时根据配置决定是否启动连接。"""
@@ -912,6 +1007,10 @@ class SnowLumaAdapterPlugin(
 
         responses: List[Mapping[str, Any]] = []
         for action_name, params in actions:
+            # 路由可能在 Broker 选中之后才被撤销，发送前仍须检查当前模式，不能实际重复发出。
+            if (self._event_router is not None
+                    and self._event_router.identity_only_lease.active(runtime_bundle.runtime_state.account_id or "")):
+                return {"success": False, "error": "SL 仅身份查询模式不提供消息发送"}
             if debug_logger is not None:
                 debug_logger.log_raw_outbound(internal_message_id, action_name, params)
             try:
@@ -997,7 +1096,7 @@ class SnowLumaAdapterPlugin(
             )
             self._runtime_bundle = runtime_builder.build(
                 on_connection_opened=self._event_router.bootstrap_adapter_runtime_state,
-                on_connection_closed=self._event_router.handle_transport_disconnected,
+                on_connection_closed=self._handle_transport_disconnected,
                 on_payload=self._event_router.handle_transport_payload,
                 on_natural_lift=self._event_router.emit_natural_lift_notice,
                 on_heartbeat_timeout=self._event_router.handle_heartbeat_timeout,
@@ -1100,6 +1199,7 @@ class SnowLumaAdapterPlugin(
 
     async def _stop_connection(self) -> None:
         """停止当前连接并清理运行时缓存。"""
+        await self._stop_identity_mode_watch()
         runtime_bundle = self._runtime_bundle
         if runtime_bundle is None:
             return
@@ -1107,6 +1207,7 @@ class SnowLumaAdapterPlugin(
         await runtime_bundle.transport.stop()
         if self._event_router is not None:
             self._event_router.reset_caches()
+        await self._publish_identity_only_status()
 
     def _require_runtime_bundle(self) -> QQRuntimeBundle:
         """返回当前已初始化的运行时组件集合。
