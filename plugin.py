@@ -11,11 +11,12 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, cast
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, cast
 
 import asyncio
 
 from maibot_sdk import API, ConfigWidget, ConfigWidgetState, MaiBotPlugin, MessageGateway, PluginConfigBase, Tool
+from maibot_sdk.config import extract_plugin_config_version
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 from .apis import (
@@ -70,6 +71,14 @@ class SnowLumaAdapterPlugin(
     """SnowLuma / SnowLuma / NapCat 统一消息网关与 QQ 能力插件。"""
 
     config_model: ClassVar[type[PluginConfigBase] | None] = QQPluginSettings
+
+    def normalize_plugin_config(self, config_data: Optional[Mapping[str, Any]]) -> Tuple[Dict[str, Any], bool]:
+        """先迁移原始配置，模型随后补默认值，保留旧字段和显式新字段的优先级。"""
+        if not config_data:
+            return super().normalize_plugin_config(config_data)
+        extract_plugin_config_version(config_data)
+        normalized = QQPluginSettings.model_validate(dict(config_data)).model_dump(mode="python")
+        return normalized, normalized != config_data
 
     config_widgets: ClassVar[List[ConfigWidget]] = [
         ConfigWidget(id="connection", kind="status", label="QQ 连接器状态"),

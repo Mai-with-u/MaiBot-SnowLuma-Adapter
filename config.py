@@ -931,11 +931,12 @@ class QQPluginSettings(PluginConfigBase):
         debug_section = _as_mapping(raw_mapping.get("debug"))
         chat_abilities_section = _as_mapping(raw_mapping.get("chat_abilities"))
         # 工具开关从插件设置移到独立分类 [chat_abilities]。
-        # SDK 会在校验前用默认值补齐 [chat_abilities]（全 false），因此 [plugin] 中
-        # 残留的旧字段值必须无条件搬迁，否则用户的开关状态会被默认值吞掉。
+        # 迁移先于默认值补齐；新分类中显式填写的值优先。
         for field_name in QQChatAbilitiesConfig.model_fields:
             if field_name in plugin_section:
-                chat_abilities_section[field_name] = plugin_section.pop(field_name)
+                legacy_value = plugin_section.pop(field_name)
+                if field_name not in chat_abilities_section:
+                    chat_abilities_section[field_name] = legacy_value
         # 调试项从插件设置移到独立分类；保留旧配置的显式值，新分类的值优先。
         for field_name in QQDebugConfig.model_fields:
             if field_name in plugin_section:
@@ -969,30 +970,16 @@ class QQPluginSettings(PluginConfigBase):
         if legacy_sources:
             source_name, source_section = legacy_sources[0]
             LOGGER.warning(f"SnowLuma 适配器检测到旧版 [{source_name}] 配置段，已自动迁移到 [client]")
-            # Runner/SDK 在校验前会用默认值补齐缺失的配置段，[client] 因此几乎总是非空，
-            # 不能再用「[client] 为空」判断是否需要迁移，否则旧配置里的 token 等字段会被
-            # 默认值覆盖后永久丢失。这里改为逐字段合并：仅当 [client] 中该字段缺失或为空
-            # 时才用旧配置的值填充，已显式设置的用户值优先。
+            # 在模型补默认值之前逐字段迁移，新分类中的显式值优先，包括空字符串和默认端口。
             known_client_keys = set(QQServerConfig.model_fields)
             migrated_client_section = dict(client_section)
             for legacy_key, legacy_value in source_section.items():
-                if legacy_key not in known_client_keys:
+                target_key = {"host": "server", "access_token": "token"}.get(legacy_key, legacy_key)
+                if target_key not in known_client_keys:
                     continue
-                # SDK 补齐的默认端口也会被视为非空；旧端口应优先于这个默认值。
-                if legacy_key == "port" and migrated_client_section.get("port") == DEFAULT_CLIENT_PORT:
-                    migrated_client_section["port"] = legacy_value
-                    continue
-                if _normalize_string(migrated_client_section.get(legacy_key)):
-                    continue
-                migrated_client_section[legacy_key] = legacy_value
+                if target_key not in migrated_client_section:
+                    migrated_client_section[target_key] = source_section.get(target_key, legacy_value)
             client_section = migrated_client_section
-            # 旧 SnowLuma 配置使用 server 字段；旧 NapCat 配置使用 host 字段，统一映射为 server。
-            legacy_host = _normalize_string(client_section.get("host"))
-            if legacy_host and not _normalize_string(client_section.get("server")):
-                client_section["server"] = legacy_host
-            legacy_access_token = _normalize_string(client_section.get("access_token"))
-            if legacy_access_token and not _normalize_string(client_section.get("token")):
-                client_section["token"] = legacy_access_token
 
         # 旧配置携带历史版本号时会触发版本校验失败；迁移时统一改写为当前版本。
         if _normalize_string(plugin_section.get("config_version")) not in {"", SUPPORTED_CONFIG_VERSION}:
