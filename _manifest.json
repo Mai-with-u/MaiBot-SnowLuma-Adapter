@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.3.0",
+  "version": "1.3.1",
   "name": "OneBot 适配器",
   "description": "QQ OneBot v11 适配器，支持通用标准模式和特殊适配",
   "author": {
@@ -22,7 +22,7 @@
     }
   },
   "host_application": {
-    "min_version": "1.3.18",
+    "min_version": "1.4.4",
     "max_version": "1.4.99"
   },
   "sdk": {

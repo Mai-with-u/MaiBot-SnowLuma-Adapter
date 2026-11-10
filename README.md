@@ -1,6 +1,6 @@
 # MaiBot OneBot 适配器（SnowLuma / NapCat）
 
-需要 MaiBot >= 1.3.18。
+需要 MaiBot >= 1.4.4，并包含插件配置「先迁移、后重建」的主程序修复。未包含该修复的 1.4.4 仍会在升级旧配置时丢字段，不能仅凭版本号判断。
 
 连接 SnowLuma / NapCat 及其他 OneBot v11 实现的 MaiBot 适配器插件。
 
