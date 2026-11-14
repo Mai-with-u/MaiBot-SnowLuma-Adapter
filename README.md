@@ -30,6 +30,18 @@
 
 4.在 Maibot Webui中的适配器设置中的 "黑白名单规则" 配置群权限，默认全部阅读（就是所有群消息都接受），可以自行改为全部不阅读（只添加阅读的群号）
 
+## 入站图片与表情包
+
+兼容 LuckyLilliaBot 的图片 `data.subType` 字段及独立的 `mface` 商城表情段，
+同时保留 NapCat / SnowLuma 的 `data.sub_type` 字段支持。普通图片（子类型 `0`）
+与自定义表情（子类型 `1`）分别传给 MaiBot 的图片与表情包组件；
+商城表情按表情包下载并传递，消息的 `is_emoji` 标记跟随实际转换结果。
+摘要 `summary` 仅是显示文字，不用于将普通图片或无子类型图片推断为表情包。
+若两种子类型字段同时存在，以 `sub_type` 为准，包括显式的 `0`。
+
+字段依据：[LuckyLilliaBot 入站转换](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/src/onebot11/transform/message/incoming.ts#L79-L89)
+及 [QQ 图片子类型定义](https://github.com/LLOneBot/LuckyLilliaBot/blob/dc2b2b90092ef0f571b5546878288b83fff1e436/src/ntqqapi/types/msg.ts#L147-L150)。
+
 ## 与 QQ 官方适配器同步成员身份
 
 同时运行新版 QQ 官方适配器时，可在官方侧先绑定真实群号，并将「关联QQ号」填为本连接器登录的 QQ 号。之后官方适配器通过公开的 `identity_observations` API 获取指定账号、指定群的短期消息指纹和昵称、群名片；双向唯一的三条不同正文匹配成功后，自动建立本群用户身份对应关系，无需成员发送验证码。
