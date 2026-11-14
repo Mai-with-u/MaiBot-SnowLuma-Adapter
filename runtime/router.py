@@ -8,6 +8,8 @@ import asyncio
 
 from ..config import QQPluginSettings
 from ..profile import PROFILE_BY_TYPE, probe_client_profile
+from ..services.identity_observations import IdentityObservations
+from ..services.identity_only_lease import IdentityOnlyLease
 from ..types import QQPayloadDict
 from .bundle import QQRuntimeBundle
 
@@ -51,6 +53,8 @@ class QQEventRouter:
         self._gateway_name = gateway_name
         self._load_settings = load_settings
         self._runtime: Optional[QQRuntimeBundle] = None
+        self.identity_observations = IdentityObservations()
+        self.identity_only_lease = IdentityOnlyLease()
 
     def bind_runtime(self, runtime: QQRuntimeBundle) -> None:
         """绑定当前路由器使用的运行时依赖。
@@ -62,6 +66,8 @@ class QQEventRouter:
 
     def reset_caches(self) -> None:
         """重置与路由相关的短期缓存。"""
+        self.identity_observations.clear()
+        self.identity_only_lease.clear()
         runtime = self._runtime
         if runtime is None:
             return
@@ -115,22 +121,24 @@ class QQEventRouter:
         if not sender_user_id:
             return
 
-        # 在成员查询和消息解析前拦截，群聊、私聊共用发送者黑名单。
-        if sender_user_id in settings.filters.ban_user_id:
-            self._logger.debug(f"用户 {sender_user_id} 在黑名单中，消息已丢弃")
-            return
-
+        identity_only = self.identity_only_lease.active(self_id)
         group_id = str(payload.get("group_id") or "").strip()
-        if self_id and sender_user_id == self_id and settings.debug.ignore_self_message:
-            return
-        if await runtime.official_bot_guard.should_reject(
-            sender_user_id=sender_user_id,
-            group_id=group_id,
-            ban_qq_bot=settings.filters.ban_qq_bot,
-            payload=payload,
-            sender=sender,
-        ):
-            return
+        if not identity_only:
+            # 普通模式在成员查询和消息解析前拦截，群聊、私聊共用发送者黑名单。
+            # 身份查询模式只采集指纹，不向 Host 投递，不能受 SL 的聊天名单限制。
+            if sender_user_id in settings.filters.ban_user_id:
+                self._logger.debug(f"用户 {sender_user_id} 在黑名单中，消息已丢弃")
+                return
+            if self_id and sender_user_id == self_id and settings.debug.ignore_self_message:
+                return
+            if await runtime.official_bot_guard.should_reject(
+                sender_user_id=sender_user_id,
+                group_id=group_id,
+                ban_qq_bot=settings.filters.ban_qq_bot,
+                payload=payload,
+                sender=sender,
+            ):
+                return
 
         try:
             message_dict = await runtime.inbound_codec.build_message_dict(payload, self_id, sender_user_id, sender)
@@ -139,11 +147,19 @@ class QQEventRouter:
             return
 
         plain_text = str(message_dict.get("processed_plain_text") or "").strip()
-        if not runtime.regex_filter.is_message_allowed(plain_text, settings.filters):
+        # 解析可能等待查询。期间进入身份模式则跳过聊天过滤；期间租约到期也不能把
+        # 已绕过名单的消息投递给 Host，只允许后续新消息恢复普通过滤和投递。
+        identity_only = identity_only or self.identity_only_lease.active(self_id)
+        if not identity_only and not runtime.regex_filter.is_message_allowed(plain_text, settings.filters):
             return
 
         message_dict["account_id"] = self_id
         message_dict["scope"] = settings.client.connection_id or None
+        if isinstance(payload.get("time"), (int, float)):
+            self.identity_observations.observe(message_dict)
+        # 先采集身份再检查短租约；消息不排队、不补投，停止续期后新消息自动恢复正常。
+        if identity_only:
+            return
         external_message_id = str(payload.get("message_id") or "").strip()
         accepted = await self._gateway_capability.route_message(
             gateway_name=self._gateway_name,
@@ -184,6 +200,10 @@ class QQEventRouter:
         runtime = self._require_runtime()
         settings = self._load_settings()
 
+        # 包括普通通知与定时器合成通知，避免绕过消息入口独立触发 Host。
+        if self.identity_only_lease.active(self_id):
+            return
+
         # 通知可能同时涉及发起者、操作者和目标，均须遵守用户黑名单。
         for field in ("user_id", "operator_id", "target_id"):
             user_id = str(payload.get(field) or "").strip()
@@ -201,6 +221,9 @@ class QQEventRouter:
 
         message_dict = await runtime.notice_codec.build_notice_message_dict(payload)
         if message_dict is None:
+            return
+        # 通知解析可能等待查询；等待期间刚激活租约，也不能继续投递这条通知。
+        if self.identity_only_lease.active(self_id):
             return
 
         message_dict["account_id"] = self_id
@@ -250,7 +273,11 @@ class QQEventRouter:
             status = payload.get("status", {})
             if not isinstance(status, Mapping):
                 status = {}
-            should_report_connected = bool(status.get("online", False)) and bool(status.get("good", False))
+            # SnowLuma 的 good 也反映近期 QQ 数据包活跃度，不能用它判定账号离线。
+            # online=False、WebSocket 断开和心跳超时仍由各自路径撤销路由。
+            should_report_connected = bool(status.get("online", False)) and (
+                runtime.profile.client_type == "snowluma" or bool(status.get("good", False))
+            )
 
         if self_id and should_report_connected:
             await runtime.runtime_state.report_connected(self_id, settings.client)
@@ -277,21 +304,26 @@ class QQEventRouter:
             return
 
         declared_type = settings.client.client_type
-        if detected_type is None:
+        if declared_type == "onebot_v11":
+            runtime.profile_state.update(PROFILE_BY_TYPE["onebot_v11"])
+        elif detected_type is None:
             if declared_type == "auto":
-                self._logger.error(
-                    f"对端 app_name='{app_name or '<空>'}' 无法识别，请在 client.client_type 中显式指定类型"
-                )
-                return
-            self._logger.warning(f"无法识别对端 app_name='{app_name or '<空>'}'，将按配置的 {declared_type} 画像运行")
+                runtime.profile_state.update(PROFILE_BY_TYPE["onebot_v11"])
+                self._logger.info(f"对端 app_name='{app_name}' 使用 OneBot v11 标准模式")
+            else:
+                runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
+                self._logger.warning(f"无法识别对端 app_name='{app_name or '<空>'}'，将按配置的 {declared_type} 画像运行")
         elif declared_type != "auto" and declared_type != detected_type:
             # 按配置声明继续运行，不静默改判；提醒用户配置与对端不一致。
+            runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
             self._logger.warning(
                 f"配置声明 client_type={declared_type}，但对端 app_name='{app_name}' 判定为 {detected_type}；"
                 "将按配置声明的画像运行，如需跟随对端请改为 auto"
             )
         elif declared_type == "auto":
             runtime.profile_state.update(PROFILE_BY_TYPE[detected_type])
+        else:
+            runtime.profile_state.update(PROFILE_BY_TYPE[declared_type])
         runtime.runtime_state.detected_protocol = detected_type or app_name or declared_type
         effective_profile = runtime.profile
         self._logger.info(

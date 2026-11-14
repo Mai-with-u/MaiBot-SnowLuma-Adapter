@@ -47,10 +47,12 @@ class QQRuntimeStateManager:
         self._reported_scope: Optional[str] = None
         self.detected_protocol: Optional[str] = None
         self._reported_protocol: Optional[str] = None
+        self._routing_enabled = True
+        self._reported_routing_enabled: Optional[bool] = True
 
     @property
     def account_id(self) -> Optional[str]:
-        """返回当前已就绪连接的账号，供适配器合成消息声明归属。"""
+        """返回底层连接账号；暂停 Host 收发路由时，身份查询仍需使用该账号。"""
         return self._reported_account_id if self._runtime_state_connected else None
 
     @property
@@ -83,14 +85,17 @@ class QQRuntimeStateManager:
             and self._reported_account_id == normalized_account_id
             and self._reported_scope == scope
             and self._reported_protocol == self.detected_protocol
+            and self._reported_routing_enabled == self._routing_enabled
         ):
             return True
 
         accepted = False
+        # 响应丢失时 Host 可能已经切换路由，下一次恢复必须重新上报，不能信任旧确认值。
+        self._reported_routing_enabled = None
         try:
             accepted = await self._gateway_capability.update_state(
                 gateway_name=self._gateway_name,
-                ready=True,
+                ready=self._routing_enabled,
                 platform="qq",
                 account_id=normalized_account_id,
                 scope=server_config.connection_id,
@@ -111,15 +116,25 @@ class QQRuntimeStateManager:
         self._reported_account_id = normalized_account_id
         self._reported_scope = scope
         self._reported_protocol = self.detected_protocol
+        self._reported_routing_enabled = self._routing_enabled
         self._logger.info(
-            f"消息网关已激活路由: platform=qq account_id={normalized_account_id} "
+            f"消息网关{'已激活' if self._routing_enabled else '已暂停'}收发路由: platform=qq account_id={normalized_account_id} "
             f"scope={self._reported_scope or '*'}"
         )
         return True
 
+    async def set_routing_enabled(self, enabled: bool, server_config: QQServerConfig) -> None:
+        """独立控制 Host 路由，保留底层连接和查询身份；心跳不得意外恢复暂停的路由。"""
+        self._routing_enabled = enabled
+        account_id = self.account_id
+        if account_id is not None and not await self.report_connected(account_id, server_config):
+            raise RuntimeError("Host 未接受 QQ 连接器收发路由切换")
+
     async def report_disconnected(self) -> None:
         """向 Host 上报当前连接已断开，并撤销消息网关路由。"""
 
+        self._routing_enabled = True
+        self._reported_routing_enabled = True
         if not self._runtime_state_connected:
             self._reported_account_id = None
             self._reported_scope = None

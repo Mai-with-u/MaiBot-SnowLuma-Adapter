@@ -26,7 +26,7 @@ from .constants import (
 
 LOGGER = logging.getLogger("snowluma_adapter.config")
 
-CLIENT_TYPE_VALUES = Literal["auto", "napcat", "snowluma"]
+CLIENT_TYPE_VALUES = Literal["auto", "onebot_v11", "napcat", "snowluma"]
 
 
 
@@ -389,18 +389,18 @@ class QQServerConfig(PluginConfigBase):
 
     client_type: CLIENT_TYPE_VALUES = Field(
         default="auto",
-        description="对端客户端类型：auto 连接后自动判定，也可固定为 napcat 或 snowluma。",
+        description="对端客户端类型：auto 自动识别 SnowLuma / NapCat，其他实现使用 OneBot v11 标准模式；也可固定为 onebot_v11、napcat 或 snowluma。",
         json_schema_extra={
-            "hint": "auto模式会自动确定连接的客户端类型",
+            "hint": "auto 自动识别厂商扩展；onebot_v11 仅使用标准能力",
             "i18n": _schema_i18n(
                 label_en="Client type",
                 label_ja="クライアント種別",
                 hint_en=(
-                    "auto detects the peer via get_version_info after each connect; "
+                    "auto detects SnowLuma / NapCat extensions; other peers use OneBot v11 standard mode; "
                     "a fixed value is cross-checked against the detected implementation."
                 ),
                 hint_ja=(
-                    "auto は接続後に get_version_info で対向を判定します；"
+                    "auto は SnowLuma / NapCat の拡張を識別し、それ以外は OneBot v11 標準モードを使用します；"
                     "固定値の場合は判定結果と一致するか検証します。"
                 ),
             ),
@@ -549,7 +549,7 @@ class QQServerConfig(PluginConfigBase):
         """
 
         normalized_value = _normalize_string(value).lower()
-        if normalized_value in {"auto", "napcat", "snowluma"}:
+        if normalized_value in {"auto", "onebot_v11", "napcat", "snowluma"}:
             return normalized_value  # type: ignore[return-value]
         if normalized_value:
             LOGGER.warning(f"无效的 client_type 值 '{value}'，已回退到 'auto'")
@@ -931,11 +931,12 @@ class QQPluginSettings(PluginConfigBase):
         debug_section = _as_mapping(raw_mapping.get("debug"))
         chat_abilities_section = _as_mapping(raw_mapping.get("chat_abilities"))
         # 工具开关从插件设置移到独立分类 [chat_abilities]。
-        # SDK 会在校验前用默认值补齐 [chat_abilities]（全 false），因此 [plugin] 中
-        # 残留的旧字段值必须无条件搬迁，否则用户的开关状态会被默认值吞掉。
+        # 迁移先于默认值补齐；新分类中显式填写的值优先。
         for field_name in QQChatAbilitiesConfig.model_fields:
             if field_name in plugin_section:
-                chat_abilities_section[field_name] = plugin_section.pop(field_name)
+                legacy_value = plugin_section.pop(field_name)
+                if field_name not in chat_abilities_section:
+                    chat_abilities_section[field_name] = legacy_value
         # 调试项从插件设置移到独立分类；保留旧配置的显式值，新分类的值优先。
         for field_name in QQDebugConfig.model_fields:
             if field_name in plugin_section:
@@ -969,30 +970,16 @@ class QQPluginSettings(PluginConfigBase):
         if legacy_sources:
             source_name, source_section = legacy_sources[0]
             LOGGER.warning(f"SnowLuma 适配器检测到旧版 [{source_name}] 配置段，已自动迁移到 [client]")
-            # Runner/SDK 在校验前会用默认值补齐缺失的配置段，[client] 因此几乎总是非空，
-            # 不能再用「[client] 为空」判断是否需要迁移，否则旧配置里的 token 等字段会被
-            # 默认值覆盖后永久丢失。这里改为逐字段合并：仅当 [client] 中该字段缺失或为空
-            # 时才用旧配置的值填充，已显式设置的用户值优先。
+            # 在模型补默认值之前逐字段迁移，新分类中的显式值优先，包括空字符串和默认端口。
             known_client_keys = set(QQServerConfig.model_fields)
             migrated_client_section = dict(client_section)
             for legacy_key, legacy_value in source_section.items():
-                if legacy_key not in known_client_keys:
+                target_key = {"host": "server", "access_token": "token"}.get(legacy_key, legacy_key)
+                if target_key not in known_client_keys:
                     continue
-                # SDK 补齐的默认端口也会被视为非空；旧端口应优先于这个默认值。
-                if legacy_key == "port" and migrated_client_section.get("port") == DEFAULT_CLIENT_PORT:
-                    migrated_client_section["port"] = legacy_value
-                    continue
-                if _normalize_string(migrated_client_section.get(legacy_key)):
-                    continue
-                migrated_client_section[legacy_key] = legacy_value
+                if target_key not in migrated_client_section:
+                    migrated_client_section[target_key] = source_section.get(target_key, legacy_value)
             client_section = migrated_client_section
-            # 旧 SnowLuma 配置使用 server 字段；旧 NapCat 配置使用 host 字段，统一映射为 server。
-            legacy_host = _normalize_string(client_section.get("host"))
-            if legacy_host and not _normalize_string(client_section.get("server")):
-                client_section["server"] = legacy_host
-            legacy_access_token = _normalize_string(client_section.get("access_token"))
-            if legacy_access_token and not _normalize_string(client_section.get("token")):
-                client_section["token"] = legacy_access_token
 
         # 旧配置携带历史版本号时会触发版本校验失败；迁移时统一改写为当前版本。
         if _normalize_string(plugin_section.get("config_version")) not in {"", SUPPORTED_CONFIG_VERSION}:

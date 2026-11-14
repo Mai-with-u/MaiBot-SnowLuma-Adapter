@@ -1,6 +1,6 @@
-"""客户端画像：NapCat / SnowLuma 能力差异定义与自动判定。
+"""客户端画像：OneBot v11 标准能力与 NapCat / SnowLuma 扩展。
 
-两类客户端都讲 OneBot v11 风格 WebSocket，但在以下维度存在实现差异，
+标准画像不启用厂商扩展。两类已知客户端都讲 OneBot v11 风格 WebSocket，但在以下维度存在实现差异，
 统一由画像（ClientProfile）声明，编解码与传输层按画像取值：
 
 1. 发送消息动作：NapCat 用 ``send_group_msg`` / ``send_private_msg``，SnowLuma 用通用 ``send_msg``。
@@ -88,6 +88,18 @@ PROFILE_BY_TYPE: Dict[str, ClientProfile] = {
     SNOWLUMA_PROFILE.client_type: SNOWLUMA_PROFILE,
 }
 
+ONEBOT_V11_PROFILE = ClientProfile(
+    client_type="onebot_v11",
+    expected_app_name="",
+    msg_action_style=MSG_ACTION_STYLE_TARGETED,
+    split_file_upload=False,
+    forward_param_key=FORWARD_PARAM_KEY_MESSAGE,
+    record_out_format="wav",
+    transcode_silk_voice=False,
+    supports_qzone=False,
+)
+PROFILE_BY_TYPE[ONEBOT_V11_PROFILE.client_type] = ONEBOT_V11_PROFILE
+
 
 class ProfileState:
     """当前连接生效画像的可变容器。
@@ -165,6 +177,7 @@ async def probe_client_profile(
     for attempt in range(1, PROBE_ATTEMPTS + 1):
         try:
             version_info = await call_action_data(PROBE_ACTION, {})
+            last_error = None
             break
         except asyncio.CancelledError:
             raise

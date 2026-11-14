@@ -11,6 +11,7 @@ import base64
 import hashlib
 import time
 
+from ...cqcode import parse_cq_message
 from ...qq_face_map import QQ_FACE_DESCRIPTIONS, QQ_FACE_EMOJIS
 from ...services import QQQueryService
 from ...types import QQIncomingSegment, QQIncomingSegments, QQPayload, QQSegment, QQSegments
@@ -184,7 +185,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         """从载荷中提取结构化消息段列表。
 
         SnowLuma 部分事件会以纯字符串形式携带 ``message`` 字段，
-        此时整体视为单个文本段。
+        此时整体视为单个文本段。OneBot v11 标准模式按 CQ 码解析字符串。
 
         Args:
             payload: 对端原始载荷。
@@ -200,6 +201,8 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             message_text = message_payload.strip()
             if not message_text:
                 raise ValueError("入站消息 message 字段为空")
+            if self._profile_state.profile.client_type == "onebot_v11":
+                return self._normalize_incoming_segments(parse_cq_message(message_payload))
             return [
                 QQIncomingSegment(
                     type="text",
