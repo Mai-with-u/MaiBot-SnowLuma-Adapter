@@ -4,6 +4,8 @@
 - SnowLuma 画像把文件段拆成独立 ``upload_group_file`` / ``upload_private_file``
   动作并保持与文本段的相对顺序；
 - 画像的文件段保持内联 ``file`` 段随消息一起发送；
+- 动图表情之后的其余消息段拆成后续发送动作：平台会丢弃同条消息里排在
+  动图表情之后的内容；
 - 合并转发动作的参数键按画像取 ``message``（NapCat）或 ``messages``（SnowLuma）；
 - 发送动作按画像取 ``send_group_msg`` / ``send_private_msg``（targeted）
   或通用 ``send_msg`` + ``message_type``（generic，SnowLuma）。
@@ -14,12 +16,59 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ...profile import MSG_ACTION_STYLE_GENERIC
+from ...qq_animated_face_ids import QQ_ANIMATED_FACE_IDS
 from .mentions import build_member_aliases, convert_text_mentions, merge_adjacent_mentions
 from .segment_encoder import QQOutboundSegmentEncoder
 
 OutboundAction = Tuple[str, Dict[str, Any]]
 
 SYNTHETIC_MESSAGE_ID_PREFIX = "qq-"
+
+
+def split_after_animated_faces(segments: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """按动图表情拆分消息段，避免同条中排在它后面的内容被平台丢弃。
+
+    QQ 把动图表情渲染为独立的贴纸元素，同一条消息里排在它后面的正文和图片不显示，
+    排在它前面的内容正常显示；因此动图表情之后的消息段另起一条发送。
+
+    Args:
+        segments: 已转换的 OneBot 消息段列表。
+
+    Returns:
+        List[List[Dict[str, Any]]]: 按发送顺序排列的消息段分组，每组为一条消息。
+    """
+    if not segments:
+        return []
+    if not any(_is_animated_face(segment) for segment in segments):
+        return [segments]
+
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        current.append(segment)
+        if _is_animated_face(segment) and index + 1 < len(segments):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _is_animated_face(segment: Mapping[str, Any]) -> bool:
+    """判断消息段是否为动图表情。
+
+    Args:
+        segment: OneBot 消息段。
+
+    Returns:
+        bool: ``face`` 段且表情 ID 属于动图表情时返回 ``True``。
+    """
+    if segment.get("type") != "face":
+        return False
+    segment_data = segment.get("data")
+    if not isinstance(segment_data, Mapping):
+        return False
+    return str(segment_data.get("id") or "").strip() in QQ_ANIMATED_FACE_IDS
 
 
 class QQOutboundCodec:
@@ -150,12 +199,16 @@ class QQOutboundCodec:
         pending_segments: List[Mapping[str, Any]] = []
 
         def flush_pending() -> None:
-            """把累积的普通消息段作为一个发送动作落地，保持与文件动作的相对顺序。"""
+            """把累积的普通消息段落地为发送动作，保持与文件动作的相对顺序。
+
+            动图表情之后的段另起一条消息，避免被平台连同贴纸元素一起丢弃。
+            """
             if not pending_segments:
                 return
             segments = self._segment_encoder.convert_segments(list(pending_segments))
             pending_segments.clear()
-            actions.append(self._build_send_action(segments, target_group_id, target_user_id))
+            for group in split_after_animated_faces(segments):
+                actions.append(self._build_send_action(group, target_group_id, target_user_id))
 
         if not isinstance(raw_message, list):
             raw_message = [raw_message]
