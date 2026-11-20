@@ -22,6 +22,27 @@ QQActionService = import_module("plugins.MaiBot-SnowLuma-Adapter-main.services.a
 QQBanStateStore = import_module("plugins.MaiBot-SnowLuma-Adapter-main.services.ban_state_store").QQBanStateStore
 
 
+@pytest.mark.asyncio
+async def test_forward_placeholder_preserves_content_without_binding_identity():
+    codec = QQInboundCodec(Mock(), Mock(), ProfileState(ONEBOT_V11_PROFILE), QQPluginSettings)
+    content = [{"type": "text", "data": {"text": "明天见"}}]
+    nested = {"type": "forward", "data": {"content": [
+        {"data": {"uin": "1094950020", "name": "小林", "content": content}},
+        {"sender": {"user_id": 123, "nickname": "小周"}, "message": content},
+    ]}}
+    message = {"type": "forward", "data": {"messages": [
+        {"sender": {"user_id": 1094950020, "nickname": "小明"}, "message": [nested]},
+    ]}}
+
+    segments, _ = await codec.convert_segments({"message": [message]}, "123")
+    (outer,) = segments[0]["data"]
+    assert (outer["user_id"], outer["user_nickname"]) == (None, "小明")
+    anonymous, known = outer["content"][0]["data"]
+    assert (anonymous["user_id"], anonymous["user_nickname"]) == (None, "小林")
+    assert (known["user_id"], known["user_nickname"]) == ("123", "小周")
+    assert anonymous["content"] == known["content"] == [{"type": "text", "data": "明天见"}]
+
+
 def test_cq_escaping_and_literal_text():
     assert parse_cq_message(" A&#91;CQ:at,qq=123&#93;[CQ:at,qq=456][CQ:image,file=a&#44;b&amp;c] ") == [
         {"type": "text", "data": {"text": " A[CQ:at,qq=123]"}},
