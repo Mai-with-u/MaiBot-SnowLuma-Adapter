@@ -130,7 +130,7 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             "raw_message": raw_message,
             "is_mentioned": is_at,
             "is_at": is_at,
-            "is_emoji": False,
+            "is_emoji": any(segment.get("type") == "emoji" for segment in raw_message),
             "is_picture": has_picture,
             "is_command": plain_text.startswith("/"),
             "is_notify": False,
@@ -328,8 +328,10 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
                 converted_segments.append(self._build_face_text_segment(segment_data))
                 continue
 
-            if segment_type == "image":
-                converted_segments.append(await self._build_image_like_segment(segment_data, is_emoji=False))
+            if segment_type in {"image", "mface"}:
+                converted_segments.append(
+                    await self._build_image_like_segment(segment_data, is_emoji=segment_type == "mface")
+                )
                 continue
 
             if segment_type == "record":
@@ -512,11 +514,13 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
         Returns:
             QQSegment: 转换后的图片或表情消息段。
         """
-        subtype = self._normalize_numeric_segment_value(segment_data.get("sub_type"))
-        actual_is_emoji = is_emoji or (subtype is not None and subtype not in {0, 4, 9})
-        emoji_hint = str(segment_data.get("summary") or "").strip()
-        if not actual_is_emoji and emoji_hint and emoji_hint != "[图片]":
-            actual_is_emoji = True
+        # LuckyLilliaBot 使用 subType，NapCat / SnowLuma 使用 sub_type；显式 0 不回退。
+        subtype = self._normalize_numeric_segment_value(
+            segment_data.get("sub_type", segment_data.get("subType"))
+        )
+        actual_is_emoji = is_emoji or (
+            isinstance(subtype, int) and not isinstance(subtype, bool) and subtype not in {0, 4, 9}
+        )
 
         binary_data = await self._load_binary_from_segment_data(segment_data, image_action_fallback=True)
         if not binary_data:
