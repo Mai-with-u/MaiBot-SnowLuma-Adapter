@@ -856,16 +856,20 @@ class QQInboundCodec(QQInboundCardMixin, QQInboundTextMixin):
             if not isinstance(node_data, Mapping):
                 node_data = {}
 
+            user_id = str(
+                sender.get("user_id")
+                or sender.get("uin")
+                or node_data.get("user_id")
+                or node_data.get("uin")
+                or ""
+            ).strip() or None
+            # QQ 合并转发可能用同一个占位号代指不同的原作者。
+            if user_id == "1094950020":
+                user_id = None
+
             forward_nodes.append(
                 {
-                    "user_id": str(
-                        sender.get("user_id")
-                        or sender.get("uin")
-                        or node_data.get("user_id")
-                        or node_data.get("uin")
-                        or ""
-                    ).strip()
-                    or None,
+                    "user_id": user_id,
                     "user_nickname": str(
                         sender.get("nickname")
                         or sender.get("name")

@@ -22,6 +22,62 @@ QQActionService = import_module("plugins.MaiBot-SnowLuma-Adapter-main.services.a
 QQBanStateStore = import_module("plugins.MaiBot-SnowLuma-Adapter-main.services.ban_state_store").QQBanStateStore
 
 
+@pytest.mark.asyncio
+async def test_forward_placeholder_preserves_content_without_binding_identity():
+    codec = QQInboundCodec(Mock(), Mock(), ProfileState(ONEBOT_V11_PROFILE), QQPluginSettings)
+    content = [{"type": "text", "data": {"text": "明天见"}}]
+    nested = {"type": "forward", "data": {"content": [
+        {"data": {"uin": "1094950020", "name": "小林", "content": content}},
+        {"sender": {"user_id": 123, "nickname": "小周"}, "message": content},
+    ]}}
+    message = {"type": "forward", "data": {"messages": [
+        {"sender": {"user_id": 1094950020, "nickname": "小明"}, "message": [nested]},
+    ]}}
+
+    segments, _ = await codec.convert_segments({"message": [message]}, "123")
+    (outer,) = segments[0]["data"]
+    assert (outer["user_id"], outer["user_nickname"]) == (None, "小明")
+    anonymous, known = outer["content"][0]["data"]
+    assert (anonymous["user_id"], anonymous["user_nickname"]) == (None, "小林")
+    assert (known["user_id"], known["user_nickname"]) == ("123", "小周")
+    assert anonymous["content"] == known["content"] == [{"type": "text", "data": "明天见"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_id,user_id,chat_type", [("123", "", "group"), ("", "456", "private")])
+async def test_forward_records_complete_nodes_in_destination(group_id, user_id, chat_type):
+    plugin = SnowLumaAdapterPlugin()
+    plugin.set_plugin_config(plugin.get_default_config())
+    runtime = Mock()
+    runtime.runtime_state.account_id = "789"
+    plugin._require_runtime_bundle = Mock(return_value=runtime)
+    content = [{"type": "text", "data": "明天见"}]
+    get_message = AsyncMock(return_value={
+        "message_info": {"user_info": {"user_id": "111", "user_nickname": "小林"}},
+        "raw_message": content,
+    })
+    open_session = AsyncMock(return_value={"success": True, "stream_id": "destination"})
+    send = AsyncMock(return_value=True)
+    plugin._ctx = SimpleNamespace(
+        message=SimpleNamespace(get_by_id=get_message), chat=SimpleNamespace(open_session=open_session),
+        send=SimpleNamespace(forward=send), logger=Mock(),
+    )
+
+    result = await plugin.tool_forward_messages(["42"], group_id, user_id, stream_id="source")
+
+    assert result["success"]
+    get_message.assert_awaited_once_with("42", stream_id="source", include_binary_data=True)
+    open_session.assert_awaited_once_with(
+        platform="qq", chat_type=chat_type, group_id=group_id, user_id=user_id,
+        account_id="789", scope=plugin.config.client.connection_id,
+    )
+    send.assert_awaited_once_with(
+        [{"message_id": "42", "user_id": "111", "user_nickname": "小林", "user_cardname": "", "content": content}],
+        "destination", storage_message=True, sync_to_maisaka_history=True,
+    )
+    runtime.action_service.call_action.assert_not_called()
+
+
 def test_cq_escaping_and_literal_text():
     assert parse_cq_message(" A&#91;CQ:at,qq=123&#93;[CQ:at,qq=456][CQ:image,file=a&#44;b&amp;c] ") == [
         {"type": "text", "data": {"text": " A[CQ:at,qq=123]"}},

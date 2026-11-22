@@ -926,6 +926,7 @@ class SnowLumaAdapterPlugin(
                 return {"success": False, "error": f"未找到消息 {message_id} 或其缺少发送者信息"}
             forward_nodes.append(
                 {
+                    "message_id": message_id,
                     "user_id": sender_user_id,
                     "user_nickname": str(user_info.get("user_nickname") or "").strip(),
                     "user_cardname": str(user_info.get("user_cardname") or "").strip(),
@@ -960,20 +961,29 @@ class SnowLumaAdapterPlugin(
                     return {"success": False, "error": f"无法读取上下文图片: {selection['source_id']} index={selection['index']}"}
                 forward_nodes.append({"user_id": bot_id, "user_nickname": bot_name, "content": image_segments})
 
-        # 组装 forward 段并复用出站编解码链路：参数键按画像取值，消息段统一编码。
-        outbound_message: Dict[str, Any] = {
-            "message_info": {"group_info": {}, "user_info": {}, "additional_config": {}},
-            "raw_message": [{"type": "forward", "data": forward_nodes}],
-        }
-        route: Dict[str, Any] = {"group_id": normalized_target_group_id, "user_id": normalized_target_user_id}
+        account_id = runtime_bundle.runtime_state.account_id
+        if not account_id:
+            return {"success": False, "error": "无法确认当前连接的机器人身份"}
+        # 由 Host 按真实目标会话发送并记录完整转发，群聊和私聊均使用入站时的账号与作用域。
         try:
-            actions = runtime_bundle.outbound_codec.build_outbound_actions(outbound_message, route)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-        try:
-            for action_name, params in actions:
-                await runtime_bundle.action_service.call_action(action_name, params)
+            target_session = await self.ctx.chat.open_session(
+                platform="qq",
+                chat_type="group" if normalized_target_group_id else "private",
+                group_id=normalized_target_group_id,
+                user_id=normalized_target_user_id,
+                account_id=account_id,
+                scope=self._load_settings().client.connection_id,
+            )
+            if not target_session["success"]:
+                return {"success": False, "error": target_session["error"]}
+            sent = await self.ctx.send.forward(
+                forward_nodes,
+                target_session["stream_id"],
+                storage_message=True,
+                sync_to_maisaka_history=True,
+            )
+            if not sent:
+                return {"success": False, "error": "目标会话的合并转发发送失败"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 

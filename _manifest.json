@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.3.1",
+  "version": "1.3.3",
   "name": "OneBot 适配器",
   "description": "QQ OneBot v11 适配器，支持通用标准模式和特殊适配",
   "author": {
@@ -42,7 +42,8 @@
     "chat.open_session",
     "component.disable",
     "component.enable",
-    "message.get_by_id"
+    "message.get_by_id",
+    "send.forward"
   ],
   "i18n": {
     "default_locale": "zh-CN",
